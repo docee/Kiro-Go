@@ -276,13 +276,13 @@ func TestGetNextForModelExcludingSkipsExcludedAccount(t *testing.T) {
 	}
 }
 
-func TestGetNextForModelExcludingRoutesMappedGPT56Model(t *testing.T) {
+func TestGetNextForModelExcludingRoutesNativeKiroGPT56Model(t *testing.T) {
 	p := newTestPool(config.Account{ID: "kiro", Enabled: true})
-	p.SetModelList("kiro", []string{"claude-sonnet-4.6"})
+	p.SetModelList("kiro", []string{"gpt-5.6-sol"})
 
-	acc := p.GetNextForModelExcluding("claude-sonnet-4.6", nil)
+	acc := p.GetNextForModelExcluding("gpt-5.6-sol", nil)
 	if acc == nil || acc.ID != "kiro" {
-		t.Fatalf("expected mapped GPT-5.6 request to select kiro account, got %#v", acc)
+		t.Fatalf("expected native Kiro GPT-5.6 request to select kiro account, got %#v", acc)
 	}
 }
 
