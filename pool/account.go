@@ -3,7 +3,9 @@
 package pool
 
 import (
+	"fmt"
 	"kiro-go/config"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -118,7 +120,7 @@ func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account
 		return acc
 	}
 
-		// 无可用账号，返回冷却时间最短的（排除额度用尽的，除非允许超额）
+	// 无可用账号，返回冷却时间最短的（排除额度用尽的，除非允许超额）
 	var best *config.Account
 	var earliest time.Time
 	for i := range p.accounts {
@@ -253,6 +255,50 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 		}
 	}
 	return best
+}
+
+// RoutingDiagnostics explains why each unique account can or cannot serve a
+// model. It intentionally excludes credentials and user-identifying fields so
+// callers can safely include it in operational logs.
+func (p *AccountPool) RoutingDiagnostics(model string, excluded map[string]bool) string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	allowOverUsage := config.GetAllowOverUsage()
+	now := time.Now()
+	seen := make(map[string]bool)
+	details := make([]string, 0, len(p.accounts))
+
+	for i := range p.accounts {
+		acc := &p.accounts[i]
+		if seen[acc.ID] {
+			continue
+		}
+		seen[acc.ID] = true
+
+		reason := "available"
+		switch {
+		case excluded != nil && excluded[acc.ID]:
+			reason = "excluded_after_failure"
+		case !p.accountHasModel(acc.ID, model):
+			models := make([]string, 0, len(p.modelLists[acc.ID]))
+			for id := range p.modelLists[acc.ID] {
+				models = append(models, id)
+			}
+			sort.Strings(models)
+			reason = fmt.Sprintf("model_not_cached available_models=%v", models)
+		case now.Before(p.cooldowns[acc.ID]):
+			reason = fmt.Sprintf("cooldown_until=%s", p.cooldowns[acc.ID].UTC().Format(time.RFC3339))
+		case acc.ExpiresAt > 0 && now.Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds:
+			reason = fmt.Sprintf("token_expiring expires_at=%d", acc.ExpiresAt)
+		case isQuotaBlocked(*acc, allowOverUsage):
+			reason = fmt.Sprintf("quota_blocked usage=%.2f limit=%.2f", acc.UsageCurrent, acc.UsageLimit)
+		}
+		details = append(details, fmt.Sprintf("account=%s reason=%s", acc.ID, reason))
+	}
+
+	return fmt.Sprintf("model=%q pool_accounts=%d configured_accounts=%d details=[%s]",
+		model, len(seen), p.totalAccounts, strings.Join(details, "; "))
 }
 
 // GetByID 根据 ID 获取账号

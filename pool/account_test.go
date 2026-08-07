@@ -4,6 +4,7 @@ import (
 	"errors"
 	"kiro-go/config"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -272,6 +273,30 @@ func TestGetNextForModelExcludingSkipsExcludedAccount(t *testing.T) {
 	acc := p.GetNextForModelExcluding("claude-sonnet-4.5", map[string]bool{"a": true})
 	if acc == nil || acc.ID != "b" {
 		t.Fatalf("expected account b, got %#v", acc)
+	}
+}
+
+func TestGetNextForModelExcludingRoutesMappedGPT56Model(t *testing.T) {
+	p := newTestPool(config.Account{ID: "kiro", Enabled: true})
+	p.SetModelList("kiro", []string{"claude-sonnet-4.6"})
+
+	acc := p.GetNextForModelExcluding("claude-sonnet-4.6", nil)
+	if acc == nil || acc.ID != "kiro" {
+		t.Fatalf("expected mapped GPT-5.6 request to select kiro account, got %#v", acc)
+	}
+}
+
+func TestRoutingDiagnosticsReportsModelMismatchWithoutCredentials(t *testing.T) {
+	p := newTestPool(config.Account{ID: "kiro-account", AccessToken: "secret-token", Enabled: true})
+	p.totalAccounts = 1
+	p.SetModelList("kiro-account", []string{"claude-sonnet-4.6"})
+
+	diagnostics := p.RoutingDiagnostics("gpt-5.6-terra", nil)
+	if !strings.Contains(diagnostics, "model_not_cached") || !strings.Contains(diagnostics, "claude-sonnet-4.6") {
+		t.Fatalf("expected model mismatch diagnostics, got %q", diagnostics)
+	}
+	if strings.Contains(diagnostics, "secret-token") {
+		t.Fatalf("diagnostics leaked account credentials: %q", diagnostics)
 	}
 }
 

@@ -27,6 +27,13 @@ var modelAliases = []modelMapping{
 	{"claude-3-opus", "claude-sonnet-4.5"},
 	{"claude-3-sonnet", "claude-sonnet-4"},
 	{"claude-3-haiku", "claude-haiku-4.5"},
+	// Codex exposes GPT model names, while Kiro's model catalog contains the
+	// underlying Claude IDs. Keep the more specific variants before the base
+	// alias because alias matching intentionally also accepts decorated model
+	// names (for example provider-prefixed IDs).
+	{"gpt-5.6-sol", "claude-opus-4.7"},
+	{"gpt-5.6-terra", "claude-sonnet-4.6"},
+	{"gpt-5.6", "claude-sonnet-4.6"},
 	{"gpt-4-turbo", "claude-sonnet-4.5"},
 	{"gpt-4o", "claude-sonnet-4.5"},
 	{"gpt-4", "claude-sonnet-4.5"},

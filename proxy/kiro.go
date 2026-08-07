@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -578,11 +579,15 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 	var totalCredits float64
 	var contextUsagePercentages []float64
 	var sawOutput bool
+	var sawToolUse bool
+	var sawMetering bool
+	var sawStopReason bool
 	pending := &pendingToolUses{}
 	trackedCallback := *callback
 	originalOnToolUse := trackedCallback.OnToolUse
 	trackedCallback.OnToolUse = func(toolUse KiroToolUse) {
 		sawOutput = true
+		sawToolUse = true
 		if originalOnToolUse != nil {
 			emitted = true
 			originalOnToolUse(toolUse)
@@ -643,8 +648,15 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 		}
 
 		inputTokens, outputTokens = updateTokensFromEvent(event, inputTokens, outputTokens)
+		eventType := headers[":event-type"]
+		eventKeys := make([]string, 0, len(event))
+		for key := range event {
+			eventKeys = append(eventKeys, key)
+		}
+		sort.Strings(eventKeys)
+		logger.Debugf("[KiroStream] event_type=%q keys=%v payload_bytes=%d", eventType, eventKeys, len(payloadBytes))
 
-		switch headers[":event-type"] {
+		switch eventType {
 		case "assistantResponseEvent":
 			if content, ok := event["content"].(string); ok && content != "" {
 				sawOutput = true
@@ -666,6 +678,7 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 				return emitted, toolErr
 			}
 		case "meteringEvent":
+			sawMetering = true
 			if usage, ok := event["usage"].(float64); ok {
 				totalCredits += usage
 			}
@@ -677,8 +690,11 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 			// stopReason rides inside metadataEvent on the wire; there is no
 			// standalone stop reason event type. Its absence after content is
 			// how callers detect a truncated stream.
-			if reason := firstStringField(event, "stopReason", "stop_reason"); reason != "" && callback.OnStopReason != nil {
-				callback.OnStopReason(reason)
+			if reason := firstStringField(event, "stopReason", "stop_reason"); reason != "" {
+				sawStopReason = true
+				if callback.OnStopReason != nil {
+					callback.OnStopReason(reason)
+				}
 			}
 		}
 	}
@@ -686,6 +702,18 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 	// Flush tools that never received a stop frame, in arrival order.
 	if err := pending.flushAll(callback); err != nil {
 		return emitted, err
+	}
+	// IdC / Enterprise profiles complete successful streams with a metering
+	// frame followed by clean EOF and never send metadataEvent. Metering closes
+	// billing for the turn, so it is a safe alternative terminal signal; a
+	// genuinely truncated stream has no metering frame. Preserve any explicit
+	// upstream stop reason when present.
+	if sawMetering && !sawStopReason && callback.OnStopReason != nil {
+		reason := "end_turn"
+		if sawToolUse {
+			reason = "tool_use"
+		}
+		callback.OnStopReason(reason)
 	}
 	if !sawOutput {
 		return emitted, errEmptyKiroStream

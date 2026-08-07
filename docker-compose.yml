@@ -9,4 +9,5 @@ services:
       - ./data:/app/data
     environment:
       - CONFIG_PATH=/app/data/config.json
+      - LOG_LEVEL=DEBUG
     restart: unless-stopped

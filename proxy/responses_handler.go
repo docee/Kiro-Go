@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"kiro-go/config"
+	"kiro-go/logger"
 	"net/http"
 	"strings"
 	"time"
@@ -116,6 +117,8 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
 	openaiReq.Model = actualModel
+	logger.Infof("[Responses] request method=%s path=%s model=%q mapped_model=%q stream=%t input_bytes=%d messages=%d tools=%d thinking=%t",
+		r.Method, r.URL.Path, req.Model, actualModel, req.Stream, len(req.Input), len(finalMessages), len(req.Tools), thinking)
 
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(openaiReq)
 	kiroPayload := OpenAIToKiro(openaiReq, thinking)
@@ -244,6 +247,7 @@ func (h *Handler) handleResponsesNonStream(
 	}
 
 	if lastErr == nil {
+		logger.Warnf("[Responses] no available accounts: %s", h.pool.RoutingDiagnostics(model, excluded))
 		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
 		return
 	}
@@ -749,6 +753,7 @@ func (h *Handler) handleResponsesStream(
 	}
 
 	if lastErr == nil {
+		logger.Warnf("[Responses] no available accounts: %s", h.pool.RoutingDiagnostics(model, excluded))
 		send("response.failed", map[string]interface{}{
 			"type": "response.failed",
 			"response": map[string]interface{}{

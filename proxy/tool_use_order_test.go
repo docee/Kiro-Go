@@ -7,6 +7,7 @@ package proxy
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"testing"
 )
@@ -210,5 +211,90 @@ func TestParseEventStreamReadsStopReasonKeyVariants(t *testing.T) {
 				t.Fatalf("stop reason=%q, want end_turn", reason)
 			}
 		})
+	}
+}
+
+func TestParseEventStreamUsesMeteringAsEnterpriseTerminalSignal(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		frames     [][]byte
+		wantReason string
+	}{
+		{
+			name: "text response",
+			frames: [][]byte{
+				awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "ok"}),
+				awsEventStreamFrame(t, "contextUsageEvent", map[string]interface{}{"contextUsagePercentage": 2.0}),
+				awsEventStreamFrame(t, "meteringEvent", map[string]interface{}{"usage": 0.01}),
+			},
+			wantReason: "end_turn",
+		},
+		{
+			name: "tool response",
+			frames: [][]byte{
+				awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
+					"toolUseId": "toolu_1", "name": "lookup", "input": `{}`, "stop": true,
+				}),
+				awsEventStreamFrame(t, "meteringEvent", map[string]interface{}{"usage": 0.01}),
+			},
+			wantReason: "tool_use",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var reason string
+			err := parseEventStream(bytes.NewReader(bytes.Join(tc.frames, nil)), &KiroStreamCallback{
+				OnText:       func(string, bool) {},
+				OnToolUse:    func(KiroToolUse) {},
+				OnStopReason: func(value string) { reason = value },
+			})
+			if err != nil {
+				t.Fatalf("unexpected parse error: %v", err)
+			}
+			if reason != tc.wantReason {
+				t.Fatalf("stop reason=%q, want %q", reason, tc.wantReason)
+			}
+		})
+	}
+}
+
+func TestParseEventStreamExplicitStopReasonOverridesMeteringFallback(t *testing.T) {
+	stream := bytes.Join([][]byte{
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "partial"}),
+		awsEventStreamFrame(t, "metadataEvent", map[string]interface{}{"stopReason": "max_tokens"}),
+		awsEventStreamFrame(t, "meteringEvent", map[string]interface{}{"usage": 0.01}),
+	}, nil)
+
+	var reasons []string
+	err := parseEventStream(bytes.NewReader(stream), &KiroStreamCallback{
+		OnText:       func(string, bool) {},
+		OnStopReason: func(value string) { reasons = append(reasons, value) },
+	})
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
+	if len(reasons) != 1 || reasons[0] != "max_tokens" {
+		t.Fatalf("stop reasons=%v, want only upstream max_tokens", reasons)
+	}
+}
+
+func TestParseEventStreamContextUsageDoesNotProveCompletion(t *testing.T) {
+	stream := bytes.Join([][]byte{
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "partial"}),
+		awsEventStreamFrame(t, "contextUsageEvent", map[string]interface{}{"contextUsagePercentage": 2.0}),
+	}, nil)
+
+	var content, reason string
+	err := parseEventStream(bytes.NewReader(stream), &KiroStreamCallback{
+		OnText:       func(value string, _ bool) { content += value },
+		OnStopReason: func(value string) { reason = value },
+	})
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
+	if reason != "" {
+		t.Fatalf("context usage synthesized stop reason %q", reason)
+	}
+	if got := classifyStreamIntegrity(len(content), 0, reason, false); !errors.Is(got, errUpstreamTruncatedResponse) {
+		t.Fatalf("context-only tail must remain truncated, got %v", got)
 	}
 }

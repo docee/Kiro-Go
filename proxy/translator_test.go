@@ -506,6 +506,9 @@ func TestParseModelAndThinking(t *testing.T) {
 		{"claude 3 haiku", "claude-3-haiku", "claude-haiku-4.5", false},
 
 		// Non-Anthropic fallbacks.
+		{"gpt-5.6 sol", "gpt-5.6-sol", "claude-opus-4.7", false},
+		{"gpt-5.6 terra", "gpt-5.6-terra", "claude-sonnet-4.6", false},
+		{"gpt-5.6 base", "gpt-5.6", "claude-sonnet-4.6", false},
 		{"gpt-4-turbo", "gpt-4-turbo", "claude-sonnet-4.5", false},
 		{"gpt-4o", "gpt-4o", "claude-sonnet-4.5", false},
 		{"gpt-4", "gpt-4", "claude-sonnet-4.5", false},
