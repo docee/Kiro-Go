@@ -119,6 +119,56 @@ func TestOpenAIToKiroReinforcesCodexPlanMode(t *testing.T) {
 	}
 }
 
+func TestOpenAIToKiroLatestDefaultModeSupersedesPlanHistory(t *testing.T) {
+	req := &OpenAIRequest{
+		Model: "gpt-5.6-sol",
+		Messages: []OpenAIMessage{
+			{Role: "developer", Content: "old rules\n<collaboration_mode># Collaboration Mode: Plan\nDo not make edits.</collaboration_mode>"},
+			{Role: "user", Content: "first request"},
+			{Role: "assistant", Content: "Here is the plan."},
+			{Role: "developer", Content: "current rules\n<collaboration_mode># Collaboration Mode: Default\nPlan mode is no longer active.</collaboration_mode>"},
+			{Role: "user", Content: "The plan is approved. Implement it."},
+		},
+		Tools: []OpenAITool{testOpenAITool("apply_patch", "")},
+	}
+
+	if openAIRequestUsesPlanMode(req) {
+		t.Fatalf("latest Default mode must supersede Plan history")
+	}
+	payload := OpenAIToKiro(req, false)
+	if len(payload.ConversationState.History) < 2 {
+		t.Fatalf("expected collaboration instructions in system priming")
+	}
+	got := payload.ConversationState.History[0].UserInputMessage.Content
+	if strings.Contains(got, "<plan_mode_guard>") || strings.Contains(got, "Collaboration Mode: Plan") {
+		t.Fatalf("stale Plan mode remained active: %q", got)
+	}
+	for _, want := range []string{"old rules", "Collaboration Mode: Default", "<default_mode_guard>", "may modify files"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q from Default-mode prompt: %q", want, got)
+		}
+	}
+}
+
+func TestOpenAIToKiroLatestPlanModeSupersedesDefaultHistory(t *testing.T) {
+	req := &OpenAIRequest{
+		Model: "gpt-5.6-sol",
+		Messages: []OpenAIMessage{
+			{Role: "developer", Content: "<collaboration_mode># Collaboration Mode: Default</collaboration_mode>"},
+			{Role: "developer", Content: "<collaboration_mode># Collaboration Mode: Plan</collaboration_mode>"},
+			{Role: "user", Content: "Plan this change"},
+		},
+	}
+	if !openAIRequestUsesPlanMode(req) {
+		t.Fatalf("latest Plan mode must supersede Default history")
+	}
+	payload := OpenAIToKiro(req, false)
+	got := payload.ConversationState.History[0].UserInputMessage.Content
+	if !strings.Contains(got, "<plan_mode_guard>") || strings.Contains(got, "Collaboration Mode: Default") {
+		t.Fatalf("latest Plan mode was not isolated: %q", got)
+	}
+}
+
 func TestStoredResponseRoundTripsToolsAndToolChoice(t *testing.T) {
 	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
 		t.Fatalf("config.Init: %v", err)

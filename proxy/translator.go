@@ -1216,11 +1216,23 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	// governing how those tools may be used.
 	var systemPrompt string
 	var nonSystemMessages []OpenAIMessage
+	activeMode, latestModeIndex := resolveOpenAICollaborationMode(req.Messages)
+	seenInstructions := make(map[string]bool)
 
-	for _, msg := range req.Messages {
+	for i, msg := range req.Messages {
 		if msg.Role == "system" || msg.Role == "developer" {
 			if s := extractOpenAIMessageText(msg.Content); s != "" {
-				systemPrompt += s + "\n"
+				// previous_response_id expansion may replay an older Plan/Default
+				// block. Preserve the rest of that developer message, but remove
+				// its obsolete mode declaration so only the latest mode governs.
+				if i != latestModeIndex && codexModeFromText(s) != codexModeUnknown {
+					s = stripCodexCollaborationModeBlocks(s)
+				}
+				key := strings.TrimSpace(s)
+				if key != "" && !seenInstructions[key] {
+					systemPrompt += key + "\n"
+					seenInstructions[key] = true
+				}
 			}
 		} else {
 			nonSystemMessages = append(nonSystemMessages, msg)
@@ -1234,8 +1246,11 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	if toolChoicePrompt != "" {
 		systemPrompt = strings.TrimSpace(systemPrompt + "\n\n" + toolChoicePrompt)
 	}
-	if isCodexPlanModePrompt(systemPrompt) {
+	switch activeMode {
+	case codexModePlan:
 		systemPrompt = strings.TrimSpace(systemPrompt + "\n\n" + codexPlanModeReinforcement)
+	case codexModeDefault:
+		systemPrompt = strings.TrimSpace(systemPrompt + "\n\n" + codexDefaultModeReinforcement)
 	}
 
 	// 构建历史消息

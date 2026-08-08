@@ -3,6 +3,7 @@ package proxy
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 )
 
@@ -10,11 +11,61 @@ const codexPlanModeReinforcement = `<plan_mode_guard>
 You are in Codex Plan mode. Do not modify files, run mutating commands, or implement the requested change. Inspect read-only state as needed, use request_user_input when a user decision is required, and return a concrete proposed implementation plan for the user to review. This restriction remains active until a later developer instruction explicitly changes the collaboration mode.
 </plan_mode_guard>`
 
-func isCodexPlanModePrompt(prompt string) bool {
+const codexDefaultModeReinforcement = `<default_mode_guard>
+The current Codex collaboration mode is Default. Any Plan-mode restriction found in older conversation history is superseded and no longer active. You may modify files and run repository-changing tools when the current user request authorizes that work.
+</default_mode_guard>`
+
+type codexCollaborationMode string
+
+const (
+	codexModeUnknown codexCollaborationMode = ""
+	codexModePlan    codexCollaborationMode = "plan"
+	codexModeDefault codexCollaborationMode = "default"
+)
+
+var collaborationModeBlockPattern = regexp.MustCompile(`(?is)<collaboration_mode>.*?</collaboration_mode>`)
+
+func codexModeFromText(prompt string) codexCollaborationMode {
 	lower := strings.ToLower(prompt)
-	return strings.Contains(lower, "collaboration mode: plan") ||
-		strings.Contains(lower, "<collaboration_mode>plan</collaboration_mode>") ||
-		(strings.Contains(lower, "# collaboration mode") && strings.Contains(lower, "plan mode"))
+	planAt := strings.LastIndex(lower, "collaboration mode: plan")
+	defaultAt := strings.LastIndex(lower, "collaboration mode: default")
+	if direct := strings.LastIndex(lower, "<collaboration_mode>plan</collaboration_mode>"); direct > planAt {
+		planAt = direct
+	}
+	if direct := strings.LastIndex(lower, "<collaboration_mode>default</collaboration_mode>"); direct > defaultAt {
+		defaultAt = direct
+	}
+	switch {
+	case planAt < 0 && defaultAt < 0:
+		return codexModeUnknown
+	case defaultAt > planAt:
+		return codexModeDefault
+	default:
+		return codexModePlan
+	}
+}
+
+func isCodexPlanModePrompt(prompt string) bool {
+	return codexModeFromText(prompt) == codexModePlan
+}
+
+func resolveOpenAICollaborationMode(messages []OpenAIMessage) (codexCollaborationMode, int) {
+	mode := codexModeUnknown
+	latestIndex := -1
+	for i, message := range messages {
+		if message.Role != "system" && message.Role != "developer" {
+			continue
+		}
+		if candidate := codexModeFromText(extractOpenAIMessageText(message.Content)); candidate != codexModeUnknown {
+			mode = candidate
+			latestIndex = i
+		}
+	}
+	return mode, latestIndex
+}
+
+func stripCodexCollaborationModeBlocks(prompt string) string {
+	return strings.TrimSpace(collaborationModeBlockPattern.ReplaceAllString(prompt, ""))
 }
 
 func countOpenAIRoles(messages []OpenAIMessage) map[string]int {
@@ -29,15 +80,8 @@ func openAIRequestUsesPlanMode(req *OpenAIRequest) bool {
 	if req == nil {
 		return false
 	}
-	var instructions strings.Builder
-	for _, message := range req.Messages {
-		if message.Role != "system" && message.Role != "developer" {
-			continue
-		}
-		instructions.WriteString(extractOpenAIMessageText(message.Content))
-		instructions.WriteByte('\n')
-	}
-	return isCodexPlanModePrompt(instructions.String())
+	mode, _ := resolveOpenAICollaborationMode(req.Messages)
+	return mode == codexModePlan
 }
 
 // mergeOpenAITools combines tool declarations while keeping the first
