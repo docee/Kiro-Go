@@ -30,6 +30,8 @@ type ResponsesObject struct {
 	IncompleteDetails  *ResponsesIncompleteDetails `json:"incomplete_details,omitempty"`
 	Instructions       string                      `json:"instructions,omitempty"`
 	StoredInput        json.RawMessage             `json:"-"`
+	StoredTools        []OpenAITool                `json:"-"`
+	StoredToolChoice   json.RawMessage             `json:"-"`
 	StoredInstr        string                      `json:"-"`
 	StoredAt           int64                       `json:"stored_at,omitempty"`
 }

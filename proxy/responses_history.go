@@ -1,5 +1,7 @@
 package proxy
 
+import "strings"
+
 // maxResponsesHistoryDepth caps how far back we walk the previous_response_id
 // chain when expanding history. The cap prevents pathological loops in
 // corrupted/cyclic stores from running forever; legitimate chains rarely go
@@ -22,16 +24,19 @@ func expandPreviousResponseHistory(prev *ResponsesObject) []OpenAIMessage {
 	chain := collectAncestorChain(prev)
 
 	messages := make([]OpenAIMessage, 0)
+	seenInstructions := make(map[string]bool)
 	for _, node := range chain {
 		// Inject the instructions stored on the ancestor as a system message
 		// so it remains in scope for downstream turns. Without this, an early
 		// system prompt set on response A would be lost the moment a new
 		// turn omits it.
-		if node.Instructions != "" {
+		instruction := strings.TrimSpace(node.Instructions)
+		if instruction != "" && !seenInstructions[instruction] {
 			messages = append(messages, OpenAIMessage{
 				Role:    "system",
 				Content: node.Instructions,
 			})
+			seenInstructions[instruction] = true
 		}
 		if prior, err := parseResponsesInput(node.StoredInput); err == nil {
 			messages = append(messages, prior...)

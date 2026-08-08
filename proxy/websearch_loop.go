@@ -187,7 +187,7 @@ func (h *Handler) callUpstreamForWebSearch(ctx context.Context, req *ClaudeReque
 				credits = c
 			},
 			OnContextUsage: func(pct float64) {
-				realInputTokens = int(pct * float64(getContextWindowSize(req.Model)) / 100.0)
+				realInputTokens = int(pct * float64(h.getContextWindowSize(req.Model)) / 100.0)
 				if pct >= 100.0 {
 					stopOverride = "model_context_window_exceeded"
 				}

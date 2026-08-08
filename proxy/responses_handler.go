@@ -31,6 +31,7 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 		h.sendOpenAIError(w, 400, "invalid_request_error", "Invalid JSON")
 		return
 	}
+	toolsProvided := req.Tools != nil
 
 	// Newer Codex clients stop sending the top-level "tools" field and embed
 	// every tool declaration -- including Codex's own built-in "exec"
@@ -38,7 +39,8 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	// "additional_tools" item inside "input" instead. Merge those in so the
 	// model actually receives them.
 	if extra := extractResponsesTools(req.Input); len(extra) > 0 {
-		req.Tools = append(req.Tools, extra...)
+		toolsProvided = true
+		req.Tools = mergeOpenAITools(req.Tools, extra)
 	}
 
 	if strings.TrimSpace(req.Model) == "" {
@@ -60,8 +62,15 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 				fmt.Sprintf("previous_response_id not found: %v", loadErr))
 			return
 		}
+		if !toolsProvided && len(prev.StoredTools) > 0 {
+			req.Tools = append([]OpenAITool(nil), prev.StoredTools...)
+		}
+		if len(req.ToolChoice) == 0 && len(prev.StoredToolChoice) > 0 {
+			req.ToolChoice = append(json.RawMessage(nil), prev.StoredToolChoice...)
+		}
 		historyMessages = expandPreviousResponseHistory(prev)
 	}
+	req.Tools = mergeOpenAITools(nil, req.Tools)
 
 	inputMessages, err := parseResponsesInput(req.Input)
 	if err != nil {
@@ -71,7 +80,7 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 
 	finalMessages := make([]OpenAIMessage, 0, len(historyMessages)+len(inputMessages)+1)
 	finalMessages = append(finalMessages, historyMessages...)
-	if strings.TrimSpace(req.Instructions) != "" {
+	if strings.TrimSpace(req.Instructions) != "" && !containsSystemInstruction(finalMessages, req.Instructions) {
 		// New instructions on this turn always take effect, even when
 		// continuing from previous_response_id. Place them after the
 		// expanded history so they apply to the current and future turns,
@@ -102,10 +111,11 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	}
 
 	openaiReq := &OpenAIRequest{
-		Model:    req.Model,
-		Messages: finalMessages,
-		Stream:   req.Stream,
-		Tools:    req.Tools,
+		Model:      req.Model,
+		Messages:   finalMessages,
+		Stream:     req.Stream,
+		Tools:      req.Tools,
+		ToolChoice: decodeToolChoice(req.ToolChoice),
 	}
 	if req.Temperature != nil {
 		openaiReq.Temperature = *req.Temperature
@@ -117,11 +127,16 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
 	openaiReq.Model = actualModel
-	logger.Infof("[Responses] request method=%s path=%s model=%q mapped_model=%q stream=%t input_bytes=%d messages=%d tools=%d thinking=%t",
-		r.Method, r.URL.Path, req.Model, actualModel, req.Stream, len(req.Input), len(finalMessages), len(req.Tools), thinking)
+	roleCounts := countOpenAIRoles(finalMessages)
+	planMode := openAIRequestUsesPlanMode(openaiReq)
+	logger.Infof("[Responses] request method=%s path=%s model=%q mapped_model=%q stream=%t input_bytes=%d messages=%d roles=user:%d,assistant:%d,system:%d,developer:%d,tool:%d tools=%d tool_names=%q tool_choice=%q plan_mode=%t thinking=%t",
+		r.Method, r.URL.Path, req.Model, actualModel, req.Stream, len(req.Input), len(finalMessages),
+		roleCounts["user"], roleCounts["assistant"], roleCounts["system"], roleCounts["developer"], roleCounts["tool"],
+		len(req.Tools), strings.Join(openAIToolNames(req.Tools), ","), summarizeToolChoice(openaiReq.ToolChoice), planMode, thinking)
 
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(openaiReq)
 	kiroPayload := OpenAIToKiro(openaiReq, thinking)
+	truncatePayloadForModel(kiroPayload, h.getContextWindowSize(actualModel))
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	respID := generateResponseID()
@@ -176,7 +191,7 @@ func (h *Handler) handleResponsesNonStream(
 			OnComplete: func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
 			OnCredits:  func(c float64) { credits = c },
 			OnContextUsage: func(pct float64) {
-				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				realInputTokens = int(pct * float64(h.getContextWindowSize(model)) / 100.0)
 			},
 			OnStopReason: func(reason string) {
 				upstreamStopReason = reason
@@ -234,6 +249,8 @@ func (h *Handler) handleResponsesNonStream(
 		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req, upstreamStopReason)
 		respObj.StoredInput = storedInput
 		respObj.Instructions = req.Instructions
+		respObj.StoredTools = append([]OpenAITool(nil), req.Tools...)
+		respObj.StoredToolChoice = append(json.RawMessage(nil), req.ToolChoice...)
 
 		if storeResponse {
 			if saveErr := saveResponse(respObj); saveErr != nil {
@@ -631,7 +648,7 @@ func (h *Handler) handleResponsesStream(
 			OnComplete: func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
 			OnCredits:  func(c float64) { credits = c },
 			OnContextUsage: func(pct float64) {
-				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				realInputTokens = int(pct * float64(h.getContextWindowSize(model)) / 100.0)
 			},
 			OnStopReason: func(reason string) {
 				upstreamStopReason = reason
@@ -736,6 +753,8 @@ func (h *Handler) handleResponsesStream(
 		respObj.CreatedAt = createdAt
 		respObj.StoredInput = storedInput
 		respObj.Instructions = req.Instructions
+		respObj.StoredTools = append([]OpenAITool(nil), req.Tools...)
+		respObj.StoredToolChoice = append(json.RawMessage(nil), req.ToolChoice...)
 
 		if storeResponse {
 			if saveErr := saveResponse(respObj); saveErr != nil {

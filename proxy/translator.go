@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -1090,6 +1091,7 @@ type OpenAIRequest struct {
 	TopP        float64         `json:"top_p,omitempty"`
 	Stream      bool            `json:"stream,omitempty"`
 	Tools       []OpenAITool    `json:"tools,omitempty"`
+	ToolChoice  interface{}     `json:"tool_choice,omitempty"`
 }
 
 type OpenAIMessage struct {
@@ -1115,8 +1117,8 @@ type OpenAITool struct {
 		Description string      `json:"description"`
 		Parameters  interface{} `json:"parameters"`
 	} `json:"function"`
-	// Namespace is set programmatically (not parsed from JSON) when a tool is
-	// flattened out of a Responses API "namespace" wrapper (e.g. Codex's
+	// Namespace is set when a tool is flattened out of a Responses API
+	// "namespace" wrapper (e.g. Codex's
 	// "collaboration" sub-agent group). Codex's own FunctionCall wire format
 	// carries the namespace as a sibling "namespace" field alongside the bare
 	// "name" (confirmed in codex-rs/protocol/src/models.rs tests, e.g.
@@ -1127,7 +1129,7 @@ type OpenAITool struct {
 	// registers the handler under ToolName{name, namespace: Some(ns)} and a
 	// response with no namespace field parses back as namespace: None, which
 	// never matches.
-	Namespace string `json:"-"`
+	Namespace string `json:"namespace,omitempty"`
 }
 
 // UnmarshalJSON accepts both the Chat Completions tool shape, where the tool
@@ -1148,6 +1150,7 @@ func (t *OpenAITool) UnmarshalJSON(data []byte) error {
 		Name        string      `json:"name"`
 		Description string      `json:"description"`
 		Parameters  interface{} `json:"parameters"`
+		Namespace   string      `json:"namespace"`
 		Function    *struct {
 			Name        string      `json:"name"`
 			Description string      `json:"description"`
@@ -1159,6 +1162,7 @@ func (t *OpenAITool) UnmarshalJSON(data []byte) error {
 	}
 
 	t.Type = raw.Type
+	t.Namespace = raw.Namespace
 	if raw.Function != nil {
 		t.Function.Name = raw.Function.Name
 		t.Function.Description = raw.Function.Description
@@ -1204,13 +1208,17 @@ type OpenAIUsage struct {
 func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	modelID := MapModel(req.Model)
 	origin := "AI_EDITOR"
+	effectiveTools, toolChoicePrompt := applyOpenAIToolChoice(req.Tools, req.ToolChoice)
 
-	// 提取系统提示
+	// Extract both system and developer instructions. The Responses API uses
+	// developer-role messages for Codex collaboration-mode rules (including
+	// Plan mode); dropping them lets Kiro see the tools but not the constraints
+	// governing how those tools may be used.
 	var systemPrompt string
 	var nonSystemMessages []OpenAIMessage
 
 	for _, msg := range req.Messages {
-		if msg.Role == "system" {
+		if msg.Role == "system" || msg.Role == "developer" {
 			if s := extractOpenAIMessageText(msg.Content); s != "" {
 				systemPrompt += s + "\n"
 			}
@@ -1222,6 +1230,12 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	// 如果启用 thinking 模式，注入 thinking 提示
 	if thinking {
 		systemPrompt = ThinkingModePrompt + "\n\n" + systemPrompt
+	}
+	if toolChoicePrompt != "" {
+		systemPrompt = strings.TrimSpace(systemPrompt + "\n\n" + toolChoicePrompt)
+	}
+	if isCodexPlanModePrompt(systemPrompt) {
+		systemPrompt = strings.TrimSpace(systemPrompt + "\n\n" + codexPlanModeReinforcement)
 	}
 
 	// 构建历史消息
@@ -1364,7 +1378,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	}
 
 	// 转换工具
-	kiroTools := convertOpenAITools(req.Tools)
+	kiroTools := convertOpenAITools(effectiveTools)
 
 	// 构建 payload
 	payload := &KiroPayload{}
@@ -1748,10 +1762,42 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 // turns were removed so the model is aware context was elided. hasPriming
 // indicates whether history begins with the 2-entry system priming pair.
 func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
+	truncatePayloadToByteLimit(payload, hasPriming, maxPayloadBytes)
+}
+
+// truncatePayloadForModel applies the smaller of the transport byte ceiling
+// and a conservative byte budget derived from Kiro's exact max-input-token
+// metadata. Three bytes per token safely covers JSON overhead and multilingual
+// prompts better than the old fixed 900 KiB-only limit.
+func truncatePayloadForModel(payload *KiroPayload, maxInputTokens int) {
+	if payload == nil || maxInputTokens <= 0 {
+		return
+	}
+	limit := maxInputTokens * 3
+	if limit <= 0 || limit > maxPayloadBytes {
+		limit = maxPayloadBytes
+	}
+	truncatePayloadToByteLimit(payload, hasSystemPriming(payload), limit)
+}
+
+func hasSystemPriming(payload *KiroPayload) bool {
+	if payload == nil || len(payload.ConversationState.History) < 2 {
+		return false
+	}
+	first := payload.ConversationState.History[0]
+	second := payload.ConversationState.History[1]
+	return first.UserInputMessage != nil && second.AssistantResponseMessage != nil &&
+		second.AssistantResponseMessage.Content == "I will follow these instructions."
+}
+
+func truncatePayloadToByteLimit(payload *KiroPayload, hasPriming bool, byteLimit int) {
 	if payload == nil {
 		return
 	}
-	if payloadByteSize(payload) <= maxPayloadBytes {
+	if byteLimit <= 0 || byteLimit > maxPayloadBytes {
+		byteLimit = maxPayloadBytes
+	}
+	if payloadByteSize(payload) <= byteLimit {
 		return
 	}
 
@@ -1793,7 +1839,7 @@ func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
 	for i := len(conversation) - 1; i >= 0; i-- {
 		running += entrySizes[i]
 		kept := len(conversation) - i
-		if running > maxPayloadBytes && kept > minRecentHistoryTurns {
+		if running > byteLimit && kept > minRecentHistoryTurns {
 			break
 		}
 		keepFrom = i
@@ -1810,10 +1856,18 @@ func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
 	rebuilt = append(rebuilt, tail...)
 	payload.ConversationState.History = rebuilt
 
-	// If still too large (current message or retained tail alone exceeds the
-	// limit), shrink the current message content as a last resort.
-	if payloadByteSize(payload) > maxPayloadBytes {
-		truncateCurrentMessage(payload)
+	// The recent-turn preference is soft: if the model-specific limit is much
+	// smaller than the transport ceiling, continue dropping old tail entries.
+	// Then trim oversized system priming before touching the active user turn.
+	for payloadByteSize(payload) > byteLimit && len(payload.ConversationState.History) > primingCount {
+		history = payload.ConversationState.History
+		payload.ConversationState.History = append(history[:primingCount], history[primingCount+1:]...)
+	}
+	if payloadByteSize(payload) > byteLimit && primingCount > 0 {
+		truncateHistoryUserMessage(payload, 0, byteLimit)
+	}
+	if payloadByteSize(payload) > byteLimit {
+		truncateCurrentMessage(payload, byteLimit)
 	}
 }
 
@@ -1852,20 +1906,46 @@ func currentMessageModelID(payload *KiroPayload) string {
 // truncateCurrentMessage hard-truncates the current message content as a last
 // resort when even the minimal retained history plus current message exceeds the
 // limit.
-func truncateCurrentMessage(payload *KiroPayload) {
+func truncateCurrentMessage(payload *KiroPayload, byteLimit int) {
 	cur := &payload.ConversationState.CurrentMessage.UserInputMessage
 	overhead := payloadByteSize(payload) - len(cur.Content)
-	budget := maxPayloadBytes - overhead
+	budget := byteLimit - overhead
 	if budget < 0 {
 		budget = 0
 	}
 	if len(cur.Content) > budget {
-		if budget == 0 {
+		cur.Content = truncateUTF8Bytes(cur.Content, budget)
+		if cur.Content == "" {
 			cur.Content = minimalFallbackUserContent
-			return
 		}
-		cur.Content = cur.Content[:budget]
 	}
+}
+
+func truncateHistoryUserMessage(payload *KiroPayload, index, byteLimit int) {
+	if index < 0 || index >= len(payload.ConversationState.History) {
+		return
+	}
+	message := payload.ConversationState.History[index].UserInputMessage
+	if message == nil || message.Content == "" {
+		return
+	}
+	overhead := payloadByteSize(payload) - len(message.Content)
+	budget := byteLimit - overhead
+	message.Content = truncateUTF8Bytes(message.Content, budget)
+}
+
+func truncateUTF8Bytes(value string, budget int) string {
+	if budget <= 0 {
+		return ""
+	}
+	if len(value) <= budget {
+		return value
+	}
+	cut := budget
+	for cut > 0 && !utf8.RuneStart(value[cut]) {
+		cut--
+	}
+	return value[:cut]
 }
 
 func buildToolResultsContinuation(toolResults []KiroToolResult) string {

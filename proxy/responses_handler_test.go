@@ -58,6 +58,24 @@ func TestResponsesParseArrayInput(t *testing.T) {
 	}
 }
 
+func TestResponsesParsePreservesDeveloperRole(t *testing.T) {
+	raw := json.RawMessage(`[{
+		"type":"message",
+		"role":"developer",
+		"content":[{"type":"input_text","text":"# Collaboration Mode: Plan"}]
+	}]`)
+	msgs, err := parseResponsesInput(raw)
+	if err != nil {
+		t.Fatalf("parse developer input: %v", err)
+	}
+	if len(msgs) != 1 || msgs[0].Role != "developer" {
+		t.Fatalf("expected one developer message, got %#v", msgs)
+	}
+	if got := extractOpenAIMessageText(msgs[0].Content); got != "# Collaboration Mode: Plan" {
+		t.Fatalf("developer content mismatch: %q", got)
+	}
+}
+
 func TestResponsesStoreAndLoad(t *testing.T) {
 	cfgFile := filepath.Join(t.TempDir(), "config.json")
 	if err := config.Init(cfgFile); err != nil {
@@ -326,6 +344,68 @@ func TestResponsesContinuationKeepsNewInstructions(t *testing.T) {
 	}
 	if !strings.Contains(capturedSystem, "speak only French") {
 		t.Fatalf("expected new instructions to reach upstream, payload=%s", capturedSystem)
+	}
+}
+
+func TestResponsesContinuationRestoresToolsAndToolChoice(t *testing.T) {
+	h, cleanup := setupResponsesTestHandler(t)
+	defer cleanup()
+
+	tool := testOpenAITool("request_user_input", "functions")
+	prev := &ResponsesObject{
+		ID:                 "resp_with_plan_tools",
+		Object:             "response",
+		Status:             "completed",
+		Model:              "gpt-5.6-sol",
+		StoredInput:        json.RawMessage(`"first user message"`),
+		StoredTools:        []OpenAITool{tool},
+		StoredToolChoice:   json.RawMessage(`{"type":"function","name":"request_user_input","namespace":"functions"}`),
+		StoredAt:           time.Now().Unix(),
+		PreviousResponseID: "",
+		Output: []ResponseOutputItem{{
+			Type: "message", Role: "assistant",
+			Content: []ResponseContentPart{{Type: "output_text", Text: "first reply"}},
+		}},
+	}
+	if err := saveResponse(prev); err != nil {
+		t.Fatalf("save prev: %v", err)
+	}
+
+	var captured map[string]interface{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+			t.Fatalf("decode upstream payload: %v", err)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+			"content": "second reply",
+		}))
+		_, _ = w.Write(awsEventStreamFrame(t, "metadataEvent", map[string]interface{}{
+			"stopReason": "end_turn",
+		}))
+	}))
+	defer server.Close()
+	defer swapKiroEndpointsForTest(t, server)()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model":"gpt-5.6-sol",
+		"input":"second user turn",
+		"previous_response_id":"resp_with_plan_tools",
+		"store":false
+	}`))
+	rec := httptest.NewRecorder()
+	h.handleOpenAIResponses(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	raw, _ := json.Marshal(captured)
+	upstream := string(raw)
+	if !strings.Contains(upstream, `"name":"request_user_input"`) {
+		t.Fatalf("expected stored plan tool in upstream payload: %s", upstream)
+	}
+	if !strings.Contains(upstream, "must call") {
+		t.Fatalf("expected stored named tool_choice to be enforced: %s", upstream)
 	}
 }
 

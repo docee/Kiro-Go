@@ -546,9 +546,9 @@ func buildAnthropicModelsResponse(cached []ModelInfo, thinkingSuffix string) []m
 	if len(cached) > 0 {
 		for _, m := range cached {
 			supportsImage := modelSupportsImage(m.InputTypes)
-			models = append(models, buildModelInfo(m.ModelId, "anthropic", supportsImage))
+			models = append(models, buildModelInfoWithTokenLimits(m.ModelId, "anthropic", supportsImage, m.TokenLimits))
 			// 自动生成 thinking 变体
-			models = append(models, buildModelInfo(m.ModelId+thinkingSuffix, "anthropic", supportsImage))
+			models = append(models, buildModelInfoWithTokenLimits(m.ModelId+thinkingSuffix, "anthropic", supportsImage, m.TokenLimits))
 		}
 	}
 	return models
@@ -584,6 +584,10 @@ func modelSupportsImage(inputTypes []string) bool {
 }
 
 func buildModelInfo(id, ownedBy string, supportsImage bool) map[string]interface{} {
+	return buildModelInfoWithTokenLimits(id, ownedBy, supportsImage, nil)
+}
+
+func buildModelInfoWithTokenLimits(id, ownedBy string, supportsImage bool, tokenLimits *ModelTokenLimits) map[string]interface{} {
 	modalities := []string{"text"}
 	if supportsImage {
 		modalities = append(modalities, "image")
@@ -593,7 +597,7 @@ func buildModelInfo(id, ownedBy string, supportsImage bool) map[string]interface
 		"output": []string{"text"},
 	}
 
-	return map[string]interface{}{
+	result := map[string]interface{}{
 		"id":               id,
 		"object":           "model",
 		"owned_by":         ownedBy,
@@ -614,6 +618,29 @@ func buildModelInfo(id, ownedBy string, supportsImage bool) map[string]interface
 			},
 		},
 	}
+	if tokenLimits != nil {
+		result["context_window"] = tokenLimits.MaxInputTokens
+		result["max_input_tokens"] = tokenLimits.MaxInputTokens
+		result["max_output_tokens"] = tokenLimits.MaxOutputTokens
+	}
+	return result
+}
+
+// getContextWindowSize prefers the exact limit returned by Kiro for the
+// selected model. The family-based fallback remains for startup/offline paths
+// where the models cache has not been populated yet.
+func (h *Handler) getContextWindowSize(model string) int {
+	wanted, _ := ParseModelAndThinking(model, config.GetThinkingConfig().Suffix)
+	h.modelsCacheMu.RLock()
+	defer h.modelsCacheMu.RUnlock()
+	for _, info := range h.cachedModels {
+		candidate, _ := ParseModelAndThinking(info.ModelId, config.GetThinkingConfig().Suffix)
+		if strings.EqualFold(strings.TrimSpace(candidate), strings.TrimSpace(wanted)) &&
+			info.TokenLimits != nil && info.TokenLimits.MaxInputTokens > 0 {
+			return info.TokenLimits.MaxInputTokens
+		}
+	}
+	return getContextWindowSize(wanted)
 }
 
 // refreshModelsCache 从 Kiro API 拉取模型列表并缓存
@@ -770,9 +797,27 @@ func mergeModelInfo(base ModelInfo, extra ModelInfo) ModelInfo {
 	}
 	if base.TokenLimits == nil {
 		base.TokenLimits = extra.TokenLimits
+	} else if extra.TokenLimits != nil {
+		base.TokenLimits = &ModelTokenLimits{
+			MaxInputTokens:  minPositive(base.TokenLimits.MaxInputTokens, extra.TokenLimits.MaxInputTokens),
+			MaxOutputTokens: minPositive(base.TokenLimits.MaxOutputTokens, extra.TokenLimits.MaxOutputTokens),
+		}
 	}
 	base.InputTypes = mergeStringLists(base.InputTypes, extra.InputTypes)
 	return base
+}
+
+func minPositive(a, b int) int {
+	switch {
+	case a <= 0:
+		return b
+	case b <= 0:
+		return a
+	case a < b:
+		return a
+	default:
+		return b
+	}
 }
 
 func mergeStringLists(base []string, extra []string) []string {
@@ -1270,7 +1315,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 				credits = c
 			},
 			OnContextUsage: func(pct float64) {
-				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				realInputTokens = int(pct * float64(h.getContextWindowSize(model)) / 100.0)
 			},
 			OnStopReason: func(reason string) {
 				upstreamStopReason = reason
@@ -1578,7 +1623,7 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 				credits = c
 			},
 			OnContextUsage: func(pct float64) {
-				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				realInputTokens = int(pct * float64(h.getContextWindowSize(model)) / 100.0)
 			},
 			OnStopReason: func(reason string) {
 				upstreamStopReason = reason
@@ -2055,7 +2100,7 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 				credits = c
 			},
 			OnContextUsage: func(pct float64) {
-				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				realInputTokens = int(pct * float64(h.getContextWindowSize(model)) / 100.0)
 			},
 		}
 
@@ -2205,7 +2250,7 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 			OnComplete: func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
 			OnCredits:  func(c float64) { credits = c },
 			OnContextUsage: func(pct float64) {
-				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				realInputTokens = int(pct * float64(h.getContextWindowSize(model)) / 100.0)
 			},
 			OnStopReason: func(reason string) {
 				upstreamStopReason = reason

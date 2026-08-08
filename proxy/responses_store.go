@@ -62,6 +62,8 @@ func saveResponse(resp *ResponsesObject) error {
 		Metadata:           resp.Metadata,
 		Instructions:       resp.Instructions,
 		StoredInput:        resp.StoredInput,
+		StoredTools:        resp.StoredTools,
+		StoredToolChoice:   resp.StoredToolChoice,
 		StoredAt:           resp.StoredAt,
 	}
 
@@ -110,6 +112,8 @@ func loadResponse(id string) (*ResponsesObject, error) {
 		Metadata:           doc.Metadata,
 		Instructions:       doc.Instructions,
 		StoredInput:        doc.StoredInput,
+		StoredTools:        doc.StoredTools,
+		StoredToolChoice:   doc.StoredToolChoice,
 		StoredAt:           doc.StoredAt,
 	}, nil
 }
@@ -178,5 +182,7 @@ type storedResponseDoc struct {
 	Metadata           map[string]string    `json:"metadata,omitempty"`
 	Instructions       string               `json:"instructions,omitempty"`
 	StoredInput        json.RawMessage      `json:"stored_input,omitempty"`
+	StoredTools        []OpenAITool         `json:"stored_tools,omitempty"`
+	StoredToolChoice   json.RawMessage      `json:"stored_tool_choice,omitempty"`
 	StoredAt           int64                `json:"stored_at"`
 }

@@ -515,6 +515,10 @@ func TestBuildAnthropicModelsResponseGeneratesThinkingVariants(t *testing.T) {
 	models := buildAnthropicModelsResponse([]ModelInfo{{
 		ModelId:    "claude-sonnet-4.5",
 		InputTypes: []string{"text", "image"},
+		TokenLimits: &ModelTokenLimits{
+			MaxInputTokens:  200_000,
+			MaxOutputTokens: 64_000,
+		},
 	}}, "-thinking")
 
 	if len(models) != 2 {
@@ -528,6 +532,18 @@ func TestBuildAnthropicModelsResponseGeneratesThinkingVariants(t *testing.T) {
 	}
 	if supportsImage, ok := models[0]["supports_image"].(bool); !ok || !supportsImage {
 		t.Fatalf("expected image capability to be preserved, got %#v", models[0]["supports_image"])
+	}
+	if models[0]["context_window"] != 200_000 || models[0]["max_output_tokens"] != 64_000 {
+		t.Fatalf("expected Kiro token limits in model response, got %#v", models[0])
+	}
+}
+
+func TestMergeModelInfoUsesSafestTokenLimitsAcrossAccounts(t *testing.T) {
+	base := ModelInfo{ModelId: "gpt-5.6-sol", TokenLimits: &ModelTokenLimits{MaxInputTokens: 256_000, MaxOutputTokens: 64_000}}
+	extra := ModelInfo{ModelId: "gpt-5.6-sol", TokenLimits: &ModelTokenLimits{MaxInputTokens: 128_000, MaxOutputTokens: 32_000}}
+	merged := mergeModelInfo(base, extra)
+	if merged.TokenLimits.MaxInputTokens != 128_000 || merged.TokenLimits.MaxOutputTokens != 32_000 {
+		t.Fatalf("expected safest shared limits, got %#v", merged.TokenLimits)
 	}
 }
 
