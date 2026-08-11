@@ -9,8 +9,12 @@ import (
 )
 
 const codexPlanModeReinforcement = `<plan_mode_guard>
-You are in Codex Plan mode. Do not modify files, run mutating commands, or implement the requested change. Inspect read-only state as needed, use request_user_input when a user decision is required, and return a concrete proposed implementation plan for the user to review. This restriction remains active until a later developer instruction explicitly changes the collaboration mode.
+You are in Codex Plan mode. Do not modify files, run mutating commands, or implement the requested change. Inspect read-only state as needed, use request_user_input when a user decision is required, and return a concrete proposed implementation plan for the user to review. A user clarification, correction, or answer supplied while planning is in progress is an intermediate continuation of the same unfinished planning workflow, not permission to end with a brief acknowledgement. Incorporate it and continue planning until you either need another user decision or can present the complete plan. This restriction remains active until a later developer instruction explicitly changes the collaboration mode.
 </plan_mode_guard>`
+
+const codexPlanToolResultContinuation = `<plan_mode_continuation_guard>
+The latest input is a user clarification, correction, or answer supplied after Plan-mode work had already begun. Incorporate it and continue the workflow in this response. Do not stop after merely acknowledging, restating, accepting, or removing the updated requirement. Continue read-only investigation if needed, ask the next necessary question, or present the complete concrete implementation plan.
+</plan_mode_continuation_guard>`
 
 const codexDefaultModeReinforcement = `<default_mode_guard>
 The current Codex collaboration mode is Default. Any Plan-mode restriction found in older conversation history is superseded and no longer active. You may modify files and run repository-changing tools when the current user request authorizes that work.
@@ -112,6 +116,43 @@ func openAIRequestUsesPlanMode(req *OpenAIRequest) bool {
 	}
 	mode, _ := resolveOpenAICollaborationMode(req.Messages)
 	return mode == codexModePlan
+}
+
+func openAIPlanModeContinuesAfterUserInput(messages []OpenAIMessage) bool {
+	last := len(messages) - 1
+	for last >= 0 && (messages[last].Role == "system" || messages[last].Role == "developer") {
+		last--
+	}
+	if last < 0 {
+		return false
+	}
+	if messages[last].Role == "user" {
+		for i := last - 1; i >= 0; i-- {
+			if messages[i].Role == "assistant" {
+				return true
+			}
+		}
+		return false
+	}
+	if messages[last].Role != "tool" {
+		return false
+	}
+
+	callID := strings.TrimSpace(messages[last].ToolCallID)
+	if callID == "" {
+		return false
+	}
+	for i := last - 1; i >= 0; i-- {
+		if messages[i].Role != "assistant" {
+			continue
+		}
+		for _, call := range messages[i].ToolCalls {
+			if call.ID == callID {
+				return strings.EqualFold(strings.TrimSpace(call.Function.Name), "request_user_input")
+			}
+		}
+	}
+	return false
 }
 
 func openAIInstructionDiagnostics(messages []OpenAIMessage) string {

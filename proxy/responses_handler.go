@@ -65,9 +65,6 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 		if !toolsProvided && len(prev.StoredTools) > 0 {
 			req.Tools = append([]OpenAITool(nil), prev.StoredTools...)
 		}
-		if len(req.ToolChoice) == 0 && len(prev.StoredToolChoice) > 0 {
-			req.ToolChoice = append(json.RawMessage(nil), prev.StoredToolChoice...)
-		}
 		historyMessages = expandPreviousResponseHistory(prev)
 	}
 	req.Tools = mergeOpenAITools(nil, req.Tools)

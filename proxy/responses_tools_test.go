@@ -119,6 +119,65 @@ func TestOpenAIToKiroReinforcesCodexPlanMode(t *testing.T) {
 	}
 }
 
+func TestOpenAIToKiroContinuesPlanAfterRequestUserInputAnswer(t *testing.T) {
+	req := &OpenAIRequest{
+		Model: "gpt-5.6-sol",
+		Messages: []OpenAIMessage{
+			{Role: "developer", Content: "<collaboration_mode># Collaboration Mode: Plan</collaboration_mode>"},
+			{Role: "user", Content: "Plan the player page redesign."},
+			{
+				Role: "assistant",
+				ToolCalls: []ToolCall{{
+					ID: "call_question",
+					Function: struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					}{Name: "request_user_input", Arguments: `{"question":"Keep playback mode?"}`},
+				}},
+			},
+			{Role: "tool", ToolCallID: "call_question", Content: "Playback mode is no longer required."},
+		},
+		Tools: []OpenAITool{testOpenAITool("request_user_input", "functions")},
+	}
+
+	if !openAIPlanModeContinuesAfterUserInput(req.Messages) {
+		t.Fatal("expected request_user_input answer to be recognized as an unfinished Plan-mode continuation")
+	}
+	payload := OpenAIToKiro(req, false)
+	if len(payload.ConversationState.History) < 2 || payload.ConversationState.History[0].UserInputMessage == nil {
+		t.Fatalf("expected Plan-mode system priming, got %#v", payload.ConversationState.History)
+	}
+	priming := payload.ConversationState.History[0].UserInputMessage.Content
+	for _, want := range []string{"<plan_mode_continuation_guard>", "Do not stop after merely acknowledging", "present the complete concrete implementation plan"} {
+		if !strings.Contains(priming, want) {
+			t.Fatalf("missing %q from Plan continuation prompt: %q", want, priming)
+		}
+	}
+}
+
+func TestOpenAIToKiroContinuesPlanAfterMidWorkflowUserCorrection(t *testing.T) {
+	req := &OpenAIRequest{
+		Model: "gpt-5.6-sol",
+		Messages: []OpenAIMessage{
+			{Role: "developer", Content: "<collaboration_mode># Collaboration Mode: Plan</collaboration_mode>"},
+			{Role: "user", Content: "Plan the player page redesign."},
+			{Role: "assistant", Content: "I am reviewing the current player structure and controls."},
+			{Role: "user", Content: "Playback mode is no longer required."},
+		},
+	}
+
+	if !openAIPlanModeContinuesAfterUserInput(req.Messages) {
+		t.Fatal("expected a user correction after Plan-mode work began to continue the unfinished workflow")
+	}
+	payload := OpenAIToKiro(req, false)
+	priming := payload.ConversationState.History[0].UserInputMessage.Content
+	for _, want := range []string{"<plan_mode_continuation_guard>", "user clarification, correction, or answer", "continue the workflow"} {
+		if !strings.Contains(priming, want) {
+			t.Fatalf("missing %q from steered Plan continuation prompt: %q", want, priming)
+		}
+	}
+}
+
 func TestOpenAIToKiroLatestDefaultModeSupersedesPlanHistory(t *testing.T) {
 	req := &OpenAIRequest{
 		Model: "gpt-5.6-sol",

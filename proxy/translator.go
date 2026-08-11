@@ -1320,6 +1320,9 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	switch activeMode {
 	case codexModePlan:
 		systemPrompt = strings.TrimSpace(systemPrompt + "\n\n" + codexPlanModeReinforcement)
+		if openAIPlanModeContinuesAfterUserInput(req.Messages) {
+			systemPrompt = strings.TrimSpace(systemPrompt + "\n\n" + codexPlanToolResultContinuation)
+		}
 	case codexModeDefault:
 		systemPrompt = strings.TrimSpace(systemPrompt + "\n\n" + codexDefaultModeReinforcement)
 	}

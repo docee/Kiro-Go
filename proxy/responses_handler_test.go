@@ -347,7 +347,7 @@ func TestResponsesContinuationKeepsNewInstructions(t *testing.T) {
 	}
 }
 
-func TestResponsesContinuationRestoresToolsAndToolChoice(t *testing.T) {
+func TestResponsesContinuationRestoresToolsButNotPriorToolChoice(t *testing.T) {
 	h, cleanup := setupResponsesTestHandler(t)
 	defer cleanup()
 
@@ -404,8 +404,82 @@ func TestResponsesContinuationRestoresToolsAndToolChoice(t *testing.T) {
 	if !strings.Contains(upstream, `"name":"request_user_input"`) {
 		t.Fatalf("expected stored plan tool in upstream payload: %s", upstream)
 	}
-	if !strings.Contains(upstream, "must call") {
-		t.Fatalf("expected stored named tool_choice to be enforced: %s", upstream)
+	if strings.Contains(upstream, "must call") {
+		t.Fatalf("a prior response's tool_choice must not constrain the continuation: %s", upstream)
+	}
+}
+
+func TestResponsesPlanAnswerContinuesUnfinishedPlanning(t *testing.T) {
+	h, cleanup := setupResponsesTestHandler(t)
+	defer cleanup()
+
+	prev := &ResponsesObject{
+		ID:           "resp_waiting_for_plan_answer",
+		Object:       "response",
+		Status:       "completed",
+		Model:        "gpt-5.6-sol",
+		Instructions: "<collaboration_mode># Collaboration Mode: Plan</collaboration_mode>",
+		StoredInput:  json.RawMessage(`"Plan the player page redesign."`),
+		StoredTools:  []OpenAITool{testOpenAITool("request_user_input", "functions")},
+		StoredToolChoice: json.RawMessage(
+			`{"type":"function","name":"request_user_input","namespace":"functions"}`,
+		),
+		StoredAt: time.Now().Unix(),
+		Output: []ResponseOutputItem{{
+			ID:        "fc_question",
+			Type:      "function_call",
+			Status:    "completed",
+			CallID:    "call_question",
+			Name:      "request_user_input",
+			Namespace: "functions",
+			Arguments: `{"question":"Keep playback mode?"}`,
+		}},
+	}
+	if err := saveResponse(prev); err != nil {
+		t.Fatalf("save prev: %v", err)
+	}
+
+	var captured map[string]interface{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+			t.Fatalf("decode upstream payload: %v", err)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+			"content": "Here is the updated implementation plan.",
+		}))
+		_, _ = w.Write(awsEventStreamFrame(t, "metadataEvent", map[string]interface{}{
+			"stopReason": "end_turn",
+		}))
+	}))
+	defer server.Close()
+	defer swapKiroEndpointsForTest(t, server)()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model":"gpt-5.6-sol",
+		"input":[{"type":"function_call_output","call_id":"call_question","output":"Playback mode is no longer required."}],
+		"previous_response_id":"resp_waiting_for_plan_answer",
+		"store":false
+	}`))
+	rec := httptest.NewRecorder()
+	h.handleOpenAIResponses(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	raw, _ := json.Marshal(captured)
+	upstream := string(raw)
+	for _, want := range []string{
+		"plan_mode_continuation_guard",
+		"Do not stop after merely acknowledging",
+		"Playback mode is no longer required.",
+	} {
+		if !strings.Contains(upstream, want) {
+			t.Fatalf("missing %q from Plan answer continuation payload: %s", want, upstream)
+		}
+	}
+	if strings.Contains(upstream, "must call") {
+		t.Fatalf("prior named tool_choice leaked into the Plan answer continuation: %s", upstream)
 	}
 }
 
