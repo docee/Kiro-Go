@@ -9,7 +9,7 @@ import (
 )
 
 const codexPlanModeReinforcement = `<plan_mode_guard>
-You are in Codex Plan mode. Do not modify files, run mutating commands, or implement the requested change. Inspect read-only state as needed, use request_user_input when a user decision is required, and return a concrete proposed implementation plan for the user to review. A user clarification, correction, or answer supplied while planning is in progress is an intermediate continuation of the same unfinished planning workflow, not permission to end with a brief acknowledgement. Incorporate it and continue planning until you either need another user decision or can present the complete plan. This restriction remains active until a later developer instruction explicitly changes the collaboration mode.
+You are in Codex Plan mode. Do not modify files, run mutating commands, or implement the requested change. Inspect read-only state as needed, use request_user_input when a user decision is required, and return a concrete proposed implementation plan for the user to review. When presenting the complete plan, the response must begin with <proposed_plan> on its own line and end with </proposed_plan> on its own line. Do not emit any preamble, acknowledgement, summary, or trailing text outside that block. A user clarification, correction, or answer supplied while planning is in progress is an intermediate continuation of the same unfinished planning workflow, not permission to end with a brief acknowledgement. Incorporate it and continue planning until you either need another user decision or can present the complete plan. This restriction remains active until a later developer instruction explicitly changes the collaboration mode.
 </plan_mode_guard>`
 
 const codexPlanToolResultContinuation = `<plan_mode_continuation_guard>
@@ -153,6 +153,29 @@ func openAIPlanModeContinuesAfterUserInput(messages []OpenAIMessage) bool {
 		}
 	}
 	return false
+}
+
+// normalizeCodexProposedPlan extracts the official Plan-mode block and makes
+// its boundary tags line-exact. Codex only renders a plan specially when the
+// response starts and ends with these tags; upstream models sometimes add a
+// prose preamble before the opening tag, which turns the whole result into a
+// plain assistant message.
+func normalizeCodexProposedPlan(content string) (string, bool) {
+	const opening = "<proposed_plan>"
+	const closing = "</proposed_plan>"
+
+	closeAt := strings.LastIndex(content, closing)
+	if closeAt < 0 {
+		return content, false
+	}
+	openAt := strings.LastIndex(content[:closeAt], opening)
+	if openAt < 0 {
+		return content, false
+	}
+
+	bodyStart := openAt + len(opening)
+	body := strings.Trim(content[bodyStart:closeAt], " \t\r\n")
+	return opening + "\n" + body + "\n" + closing, true
 }
 
 func openAIInstructionDiagnostics(messages []OpenAIMessage) string {

@@ -42,6 +42,10 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 		toolsProvided = true
 		req.Tools = mergeOpenAITools(req.Tools, extra)
 	}
+	// Multi-Agent v2 may declare collaboration as a top-level namespace tool
+	// instead of an input.additional_tools item. Expand both forms before tool
+	// deduplication so Kiro receives the actual spawn/send/wait functions.
+	req.Tools = flattenResponsesTools(req.Tools)
 
 	if strings.TrimSpace(req.Model) == "" {
 		req.Model = defaultResponsesModel
@@ -152,18 +156,18 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 
 	if req.Stream {
 		h.handleResponsesStream(r.Context(), w, kiroPayload, actualModel, thinking, estimatedInputTokens,
-			apiKeyID, respID, &req, storedInputCopy, storeResponse)
+			apiKeyID, respID, &req, storedInputCopy, storeResponse, planMode)
 		return
 	}
 
 	h.handleResponsesNonStream(r.Context(), w, kiroPayload, actualModel, thinking, estimatedInputTokens,
-		apiKeyID, respID, &req, storedInputCopy, storeResponse)
+		apiKeyID, respID, &req, storedInputCopy, storeResponse, planMode)
 }
 
 func (h *Handler) handleResponsesNonStream(
 	ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
 	estimatedInputTokens int, apiKeyID, respID string,
-	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
+	req *ResponsesRequest, storedInput json.RawMessage, storeResponse, planMode bool,
 ) {
 	excluded := make(map[string]bool)
 	var lastErr error
@@ -239,6 +243,9 @@ func (h *Handler) handleResponsesNonStream(
 		}
 
 		finalContent, _ := extractThinkingFromContent(content)
+		if planMode {
+			finalContent, _ = normalizeCodexProposedPlan(finalContent)
+		}
 		if !thinking {
 			reasoningContent = ""
 		}
@@ -412,7 +419,7 @@ func buildResponsesObject(
 func (h *Handler) handleResponsesStream(
 	ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
 	estimatedInputTokens int, apiKeyID, respID string,
-	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
+	req *ResponsesRequest, storedInput json.RawMessage, storeResponse, planMode bool,
 ) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -476,6 +483,8 @@ func (h *Handler) handleResponsesStream(
 
 		var (
 			fullText           strings.Builder
+			messageText        strings.Builder
+			pendingPlanText    strings.Builder
 			reasoningText      strings.Builder
 			toolUses           []KiroToolUse
 			inputTokens        int
@@ -518,6 +527,22 @@ func (h *Handler) handleResponsesStream(
 			})
 		}
 
+		emitVisibleText := func(text string) {
+			if text == "" {
+				return
+			}
+			ensureMessageStarted()
+			messageText.WriteString(text)
+			send("response.output_text.delta", map[string]interface{}{
+				"type":          "response.output_text.delta",
+				"item_id":       messageItemID,
+				"output_index":  outputIndex,
+				"content_index": contentIndex,
+				"delta":         text,
+			})
+			responseStarted = true
+		}
+
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
 				if text == "" {
@@ -528,17 +553,17 @@ func (h *Handler) handleResponsesStream(
 					return
 				}
 				fullText.WriteString(text)
-				ensureMessageStarted()
-				send("response.output_text.delta", map[string]interface{}{
-					"type":          "response.output_text.delta",
-					"item_id":       messageItemID,
-					"output_index":  outputIndex,
-					"content_index": contentIndex,
-					"delta":         text,
-				})
-				responseStarted = true
+				if planMode {
+					pendingPlanText.WriteString(text)
+					return
+				}
+				emitVisibleText(text)
 			},
 			OnToolUse: func(tu KiroToolUse) {
+				if pendingPlanText.Len() > 0 {
+					emitVisibleText(pendingPlanText.String())
+					pendingPlanText.Reset()
+				}
 				if messageStarted {
 					send("response.content_part.done", map[string]interface{}{
 						"type":          "response.content_part.done",
@@ -547,7 +572,7 @@ func (h *Handler) handleResponsesStream(
 						"content_index": contentIndex,
 						"part": map[string]interface{}{
 							"type": "output_text",
-							"text": fullText.String(),
+							"text": messageText.String(),
 						},
 					})
 					send("response.output_item.done", map[string]interface{}{
@@ -560,11 +585,12 @@ func (h *Handler) handleResponsesStream(
 							"status": "completed",
 							"content": []map[string]interface{}{{
 								"type": "output_text",
-								"text": fullText.String(),
+								"text": messageText.String(),
 							}},
 						},
 					})
 					messageStarted = false
+					messageText.Reset()
 					outputIndex++
 				}
 
@@ -674,6 +700,8 @@ func (h *Handler) handleResponsesStream(
 		// clearing.
 		reset := func() {
 			fullText.Reset()
+			messageText.Reset()
+			pendingPlanText.Reset()
 			reasoningText.Reset()
 			toolUses = nil
 			inputTokens = 0
@@ -714,6 +742,17 @@ func (h *Handler) handleResponsesStream(
 		}
 
 		finalContent, _ := extractThinkingFromContent(fullText.String())
+		if planMode {
+			if normalized, ok := normalizeCodexProposedPlan(finalContent); ok {
+				finalContent = normalized
+				pendingPlanText.Reset()
+				pendingPlanText.WriteString(normalized)
+			}
+			if pendingPlanText.Len() > 0 {
+				emitVisibleText(pendingPlanText.String())
+				pendingPlanText.Reset()
+			}
+		}
 		reasoning := reasoningText.String()
 		if !thinking {
 			reasoning = ""
@@ -727,7 +766,7 @@ func (h *Handler) handleResponsesStream(
 				"content_index": contentIndex,
 				"part": map[string]interface{}{
 					"type": "output_text",
-					"text": finalContent,
+					"text": messageText.String(),
 				},
 			})
 			send("response.output_item.done", map[string]interface{}{
@@ -740,7 +779,7 @@ func (h *Handler) handleResponsesStream(
 					"status": "completed",
 					"content": []map[string]interface{}{{
 						"type": "output_text",
-						"text": finalContent,
+						"text": messageText.String(),
 					}},
 				},
 			})

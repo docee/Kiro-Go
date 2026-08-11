@@ -109,13 +109,33 @@ func TestOpenAIToKiroReinforcesCodexPlanMode(t *testing.T) {
 		t.Fatalf("expected Plan mode system priming")
 	}
 	got := payload.ConversationState.History[0].UserInputMessage.Content
-	for _, want := range []string{"Collaboration Mode: Plan", "<plan_mode_guard>", "Do not modify files", "proposed implementation plan"} {
+	for _, want := range []string{"Collaboration Mode: Plan", "<plan_mode_guard>", "Do not modify files", "response must begin with <proposed_plan>"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("missing %q from Plan mode prompt: %q", want, got)
 		}
 	}
 	if !openAIRequestUsesPlanMode(req) {
 		t.Fatalf("expected request to be detected as Plan mode")
+	}
+}
+
+func TestNormalizeCodexProposedPlanDropsTextOutsideBlock(t *testing.T) {
+	raw := "Plan is ready. <proposed_plan>\r\n# Title\n\n- Change\n</proposed_plan> trailing note"
+	got, ok := normalizeCodexProposedPlan(raw)
+	if !ok {
+		t.Fatal("expected proposed plan block to be detected")
+	}
+	want := "<proposed_plan>\n# Title\n\n- Change\n</proposed_plan>"
+	if got != want {
+		t.Fatalf("normalized plan mismatch:\ngot:  %q\nwant: %q", got, want)
+	}
+}
+
+func TestNormalizeCodexProposedPlanLeavesOrdinaryTextAlone(t *testing.T) {
+	raw := "I still need one product decision."
+	got, ok := normalizeCodexProposedPlan(raw)
+	if ok || got != raw {
+		t.Fatalf("ordinary Plan-mode text changed: got=%q detected=%t", got, ok)
 	}
 }
 

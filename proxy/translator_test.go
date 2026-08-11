@@ -509,6 +509,9 @@ func TestParseModelAndThinking(t *testing.T) {
 		{"native Kiro gpt-5.6 sol", "gpt-5.6-sol", "gpt-5.6-sol", false},
 		{"native Kiro gpt-5.6 terra", "gpt-5.6-terra", "gpt-5.6-terra", false},
 		{"native Kiro gpt-5.6 luna", "gpt-5.6-luna", "gpt-5.6-luna", false},
+		{"native Kiro gpt-5.6 luna thinking", "gpt-5.6-luna-thinking", "gpt-5.6-luna-thinking", true},
+		{"Codex researcher fallback", "gpt-5.4-mini", "gpt-5.6-luna", false},
+		{"Codex spark fallback", "gpt-5.3-codex-spark", "gpt-5.6-luna", false},
 		{"gpt-4-turbo", "gpt-4-turbo", "claude-sonnet-4.5", false},
 		{"gpt-4o", "gpt-4o", "claude-sonnet-4.5", false},
 		{"gpt-4", "gpt-4", "claude-sonnet-4.5", false},
@@ -518,6 +521,8 @@ func TestParseModelAndThinking(t *testing.T) {
 		{"thinking suffix on dash form", "claude-opus-4-8-thinking", "claude-opus-4.8", true},
 		{"thinking suffix on dot form", "claude-sonnet-4.5-thinking", "claude-sonnet-4.5", true},
 		{"thinking suffix on legacy alias", "claude-3-5-sonnet-thinking", "claude-sonnet-4.5", true},
+		{"thinking suffix on Codex researcher fallback", "gpt-5.4-mini-thinking", "gpt-5.6-luna-thinking", true},
+		{"thinking suffix on Codex spark fallback", "gpt-5.3-codex-spark-thinking", "gpt-5.6-luna-thinking", true},
 
 		// Unknown models pass through unchanged.
 		{"unknown model", "some-other-model", "some-other-model", false},
@@ -547,6 +552,29 @@ func TestParseModelAndThinkingDoesNotRewriteDatedSnapshotMinor(t *testing.T) {
 	}
 	if strings.Contains(got, ".") {
 		t.Fatalf("dated snapshot must not be rewritten with a dot, got %q", got)
+	}
+}
+
+func TestCodexResearcherThinkingFallbackUsesLunaWithThinkingPrompt(t *testing.T) {
+	model, thinking := ParseModelAndThinking("gpt-5.4-mini-thinking", "-thinking")
+	if model != "gpt-5.6-luna-thinking" || !thinking {
+		t.Fatalf("expected Luna thinking fallback, got model=%q thinking=%v", model, thinking)
+	}
+
+	req := &OpenAIRequest{
+		Model:    model,
+		Messages: []OpenAIMessage{{Role: "user", Content: "research this"}},
+	}
+	payload := OpenAIToKiro(req, thinking)
+	current := payload.ConversationState.CurrentMessage.UserInputMessage
+	if current.ModelID != "gpt-5.6-luna-thinking" {
+		t.Fatalf("expected account routing to use the native Luna thinking model, got %q", current.ModelID)
+	}
+	if len(payload.ConversationState.History) == 0 || payload.ConversationState.History[0].UserInputMessage == nil {
+		t.Fatal("expected thinking system priming in Kiro history")
+	}
+	if got := payload.ConversationState.History[0].UserInputMessage.Content; !strings.Contains(got, ThinkingModePrompt) {
+		t.Fatalf("expected thinking prompt in Kiro payload, got %q", got)
 	}
 }
 

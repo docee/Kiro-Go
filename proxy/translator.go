@@ -37,6 +37,16 @@ var modelAliases = []modelMapping{
 	{"gpt-4o", "claude-sonnet-4.5"},
 	{"gpt-4", "claude-sonnet-4.5"},
 	{"gpt-3.5-turbo", "claude-sonnet-4.5"},
+	{"gpt-5.4-mini", "gpt-5.6-luna"},
+	{"gpt-5.3-codex-spark", "gpt-5.6-luna"},
+}
+
+// nativeThinkingModelAliases preserve Kiro model IDs where -thinking names a
+// distinct upstream model instead of only requesting prompt-based thinking.
+var nativeThinkingModelAliases = map[string]string{
+	"gpt-5.4-mini-thinking":        "gpt-5.6-luna-thinking",
+	"gpt-5.3-codex-spark-thinking": "gpt-5.6-luna-thinking",
+	"gpt-5.6-luna-thinking":        "gpt-5.6-luna-thinking",
 }
 
 // claudeVersionPattern normalizes "claude-{family}-N-M" to "claude-{family}-N.M".
@@ -81,6 +91,10 @@ const minRecentHistoryTurns = 4
 func ParseModelAndThinking(model string, thinkingSuffix string) (string, bool) {
 	lower := strings.ToLower(model)
 	thinking := false
+
+	if mapped, ok := nativeThinkingModelAliases[lower]; ok {
+		return mapped, true
+	}
 
 	// Strip the configured thinking suffix (e.g. "-thinking") if present.
 	suffixLower := strings.ToLower(thinkingSuffix)
@@ -1141,6 +1155,11 @@ type OpenAITool struct {
 	// response with no namespace field parses back as namespace: None, which
 	// never matches.
 	Namespace string `json:"namespace,omitempty"`
+	// Children preserves the nested tools carried by Responses API namespace
+	// declarations. It is internal-only: namespaces are flattened before the
+	// request is sent to Kiro, while each callable child retains Namespace for
+	// the function_call response round trip back to Codex.
+	Children []OpenAITool `json:"-"`
 }
 
 // UnmarshalJSON accepts both the Chat Completions tool shape, where the tool
@@ -1157,11 +1176,12 @@ type OpenAITool struct {
 // which Kiro rejects with HTTP 400 "Improperly formed request".
 func (t *OpenAITool) UnmarshalJSON(data []byte) error {
 	var raw struct {
-		Type        string      `json:"type"`
-		Name        string      `json:"name"`
-		Description string      `json:"description"`
-		Parameters  interface{} `json:"parameters"`
-		Namespace   string      `json:"namespace"`
+		Type        string            `json:"type"`
+		Name        string            `json:"name"`
+		Description string            `json:"description"`
+		Parameters  interface{}       `json:"parameters"`
+		Namespace   string            `json:"namespace"`
+		Tools       []json.RawMessage `json:"tools"`
 		Function    *struct {
 			Name        string      `json:"name"`
 			Description string      `json:"description"`
@@ -1174,6 +1194,14 @@ func (t *OpenAITool) UnmarshalJSON(data []byte) error {
 
 	t.Type = raw.Type
 	t.Namespace = raw.Namespace
+	t.Children = nil
+	for _, nested := range raw.Tools {
+		var child OpenAITool
+		if err := json.Unmarshal(nested, &child); err != nil {
+			continue
+		}
+		t.Children = append(t.Children, child)
+	}
 	if raw.Function != nil {
 		t.Function.Name = raw.Function.Name
 		t.Function.Description = raw.Function.Description

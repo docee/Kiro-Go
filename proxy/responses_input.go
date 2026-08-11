@@ -237,32 +237,43 @@ func extractResponsesTools(raw json.RawMessage) []OpenAITool {
 // "namespace" field carried alongside it on the wire (see OpenAITool.Namespace),
 // not a namespace-prefixed name.
 func decodeResponsesTool(raw json.RawMessage) []OpenAITool {
-	var head struct {
-		Type  string            `json:"type"`
-		Name  string            `json:"name"`
-		Tools []json.RawMessage `json:"tools"`
-	}
-	if err := json.Unmarshal(raw, &head); err != nil {
-		return nil
-	}
-	if head.Type == "namespace" {
-		var out []OpenAITool
-		for _, nested := range head.Tools {
-			for _, tool := range decodeResponsesTool(nested) {
-				if tool.Namespace == "" {
-					tool.Namespace = head.Name
-				}
-				out = append(out, tool)
-			}
-		}
-		return out
-	}
-
 	var tool OpenAITool
 	if err := json.Unmarshal(raw, &tool); err != nil {
 		return nil
 	}
-	return []OpenAITool{tool}
+	return flattenResponsesTools([]OpenAITool{tool})
+}
+
+// flattenResponsesTools expands namespace wrappers from either top-level
+// Responses tools or input.additional_tools. Codex currently uses both wire
+// shapes depending on client/version. Kiro only accepts callable function and
+// custom tools, so forwarding the namespace wrapper itself silently removes
+// all collaboration tools from the model's usable tool set.
+func flattenResponsesTools(tools []OpenAITool) []OpenAITool {
+	var out []OpenAITool
+	var flatten func(OpenAITool, string)
+	flatten = func(tool OpenAITool, inheritedNamespace string) {
+		if tool.Type == "namespace" {
+			namespace := strings.TrimSpace(tool.Function.Name)
+			if namespace == "" {
+				namespace = inheritedNamespace
+			}
+			for _, child := range tool.Children {
+				flatten(child, namespace)
+			}
+			return
+		}
+		if tool.Namespace == "" {
+			tool.Namespace = inheritedNamespace
+		}
+		tool.Children = nil
+		out = append(out, tool)
+	}
+
+	for _, tool := range tools {
+		flatten(tool, "")
+	}
+	return out
 }
 
 func buildMessageFromInputItem(obj map[string]interface{}, role string) *OpenAIMessage {

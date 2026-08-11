@@ -657,6 +657,67 @@ func TestResponsesStreamSSE(t *testing.T) {
 	}
 }
 
+func TestResponsesPlanStreamNormalizesProposedPlanBlock(t *testing.T) {
+	h, cleanup := setupResponsesTestHandler(t)
+	defer cleanup()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		for _, content := range []string{
+			"Plan is ready and locked.",
+			"<proposed_plan>\r\n# Player redesign\n\n- Update controls\n</proposed_plan>",
+		} {
+			_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+				"content": content,
+			}))
+		}
+		_, _ = w.Write(awsEventStreamFrame(t, "metadataEvent", map[string]interface{}{
+			"stopReason": "end_turn",
+		}))
+	}))
+	defer server.Close()
+	defer swapKiroEndpointsForTest(t, server)()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model":"claude-sonnet-4.5",
+		"instructions":"<collaboration_mode># Collaboration Mode: Plan</collaboration_mode>",
+		"input":"plan the player redesign",
+		"stream":true,
+		"store":false
+	}`))
+	rec := httptest.NewRecorder()
+	h.handleOpenAIResponses(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var streamedText strings.Builder
+	for _, line := range strings.Split(rec.Body.String(), "\n") {
+		if !strings.HasPrefix(line, "data: ") || line == "data: [DONE]" {
+			continue
+		}
+		var event struct {
+			Type  string `json:"type"`
+			Delta string `json:"delta"`
+		}
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &event); err != nil {
+			t.Fatalf("decode SSE data line: %v line=%q", err, line)
+		}
+		if event.Type == "response.output_text.delta" {
+			streamedText.WriteString(event.Delta)
+		}
+	}
+
+	want := "<proposed_plan>\n# Player redesign\n\n- Update controls\n</proposed_plan>"
+	if got := streamedText.String(); got != want {
+		t.Fatalf("streamed Plan output was not normalized:\ngot:  %q\nwant: %q\nbody:\n%s", got, want, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "Plan is ready and locked.") {
+		t.Fatalf("Plan preamble leaked into the client stream:\n%s", rec.Body.String())
+	}
+}
+
 // TestExtractResponsesToolsAdditionalTools covers newer Codex clients
 // (v0.146+) that stop sending the top-level "tools" field and instead embed
 // every tool -- including Codex's own built-in "exec" custom tool that
@@ -707,6 +768,96 @@ func TestExtractResponsesToolsAdditionalTools(t *testing.T) {
 	}
 	if followup.Namespace != "collaboration" {
 		t.Fatalf("expected followup_task to carry its source namespace for the response round trip, got %q", followup.Namespace)
+	}
+}
+
+func TestResponsesTopLevelNamespaceToolsAreFlattened(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.6-sol",
+		"input":"use parallel agents",
+		"tools":[{
+			"type":"namespace",
+			"name":"collaboration",
+			"description":"Coordinate sub-agents",
+			"tools":[
+				{"type":"function","name":"spawn_agent","description":"Spawn","parameters":{"type":"object"}},
+				{"type":"function","name":"send_message","description":"Send","parameters":{"type":"object"}},
+				{"type":"function","name":"wait_agent","description":"Wait","parameters":{"type":"object"}}
+			]
+		}]
+	}`)
+
+	var req ResponsesRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		t.Fatalf("decode Responses request: %v", err)
+	}
+	tools := flattenResponsesTools(req.Tools)
+	if len(tools) != 3 {
+		t.Fatalf("expected 3 collaboration functions, got %d: %+v", len(tools), tools)
+	}
+	for i, want := range []string{"spawn_agent", "send_message", "wait_agent"} {
+		if tools[i].Function.Name != want {
+			t.Fatalf("tool[%d] name = %q, want %q", i, tools[i].Function.Name, want)
+		}
+		if tools[i].Namespace != "collaboration" {
+			t.Fatalf("tool[%d] namespace = %q, want collaboration", i, tools[i].Namespace)
+		}
+	}
+
+	wrapped := convertOpenAITools(tools)
+	if len(wrapped) != 3 {
+		t.Fatalf("expected all flattened collaboration tools to reach Kiro, got %d", len(wrapped))
+	}
+}
+
+func TestResponsesHandlerForwardsTopLevelCollaborationFunctions(t *testing.T) {
+	h, cleanup := setupResponsesTestHandler(t)
+	defer cleanup()
+
+	var captured map[string]interface{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+			t.Fatalf("decode upstream payload: %v", err)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+			"content": "ready",
+		}))
+		_, _ = w.Write(awsEventStreamFrame(t, "metadataEvent", map[string]interface{}{
+			"stopReason": "end_turn",
+		}))
+	}))
+	defer server.Close()
+	defer swapKiroEndpointsForTest(t, server)()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model":"gpt-5.6-sol",
+		"input":"use parallel agents",
+		"store":false,
+		"tools":[{
+			"type":"namespace",
+			"name":"collaboration",
+			"tools":[
+				{"type":"function","name":"spawn_agent","description":"Spawn","parameters":{"type":"object"}},
+				{"type":"function","name":"wait_agent","description":"Wait","parameters":{"type":"object"}}
+			]
+		}]
+	}`))
+	rec := httptest.NewRecorder()
+	h.handleOpenAIResponses(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	raw, _ := json.Marshal(captured)
+	upstream := string(raw)
+	for _, want := range []string{`"name":"spawn_agent"`, `"name":"wait_agent"`} {
+		if !strings.Contains(upstream, want) {
+			t.Fatalf("missing flattened collaboration tool %s from upstream payload: %s", want, upstream)
+		}
+	}
+	if strings.Contains(upstream, `"name":"collaboration"`) {
+		t.Fatalf("namespace wrapper leaked to Kiro instead of callable children: %s", upstream)
 	}
 }
 
