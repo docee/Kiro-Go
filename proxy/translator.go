@@ -1,10 +1,15 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/jpeg"
+	"image/png"
 	"kiro-go/config"
+	"math"
 	"regexp"
 	"strings"
 	"time"
@@ -60,6 +65,12 @@ const maxPayloadBytes = 900 * 1024
 // truncationPlaceholder is inserted in history where older turns were dropped to
 // fit within maxPayloadBytes.
 const truncationPlaceholder = "[Earlier conversation history was truncated to fit the model's input limit. Older messages and tool activity have been omitted.]"
+const middleTruncationPlaceholder = "\n\n[Middle content truncated to fit the model's input limit.]\n\n"
+const toolResultTruncationPlaceholder = "\n\n[Tool output truncated to fit the upstream request limit.]\n\n"
+const imageOmissionPlaceholder = "\n\n[Some attached images were omitted because the upstream request payload limit was exceeded.]"
+const taskAnchorPrefix = "[Original task context retained after conversation compaction]\n"
+const latestContextPrefix = "\n\n[Latest tool output and attachments]\n"
+const maxTaskAnchorBytes = 64 * 1024
 
 // minRecentHistoryTurns is the number of most-recent history entries always kept
 // (in addition to system priming and the active tool turn) when truncating.
@@ -1205,6 +1216,64 @@ type OpenAIUsage struct {
 
 // ==================== OpenAI -> Kiro 转换 ====================
 
+func coalesceConsecutiveOpenAIUserMessages(messages []OpenAIMessage) []OpenAIMessage {
+	if len(messages) < 2 {
+		return messages
+	}
+	merged := make([]OpenAIMessage, 0, len(messages))
+	for _, message := range messages {
+		if message.Role == "user" && len(merged) > 0 && merged[len(merged)-1].Role == "user" {
+			merged[len(merged)-1].Content = mergeOpenAIUserContent(merged[len(merged)-1].Content, message.Content)
+			continue
+		}
+		merged = append(merged, message)
+	}
+	return merged
+}
+
+func mergeOpenAIUserContent(first, second interface{}) interface{} {
+	parts := make([]interface{}, 0, 4)
+	parts = append(parts, openAIContentParts(first)...)
+	if len(parts) > 0 {
+		parts = append(parts, map[string]interface{}{"type": "input_text", "text": "\n\n"})
+	}
+	parts = append(parts, openAIContentParts(second)...)
+	return parts
+}
+
+func openAIContentParts(content interface{}) []interface{} {
+	switch value := content.(type) {
+	case nil:
+		return nil
+	case string:
+		if value == "" {
+			return nil
+		}
+		return []interface{}{map[string]interface{}{"type": "input_text", "text": value}}
+	case []interface{}:
+		return append([]interface{}(nil), value...)
+	case map[string]interface{}:
+		return []interface{}{value}
+	default:
+		return []interface{}{value}
+	}
+}
+
+func initialOpenAITaskAnchor(messages []OpenAIMessage) string {
+	var anchor string
+	for _, message := range messages {
+		switch message.Role {
+		case "user":
+			if text := strings.TrimSpace(extractOpenAIMessageText(message.Content)); text != "" {
+				anchor = text
+			}
+		case "assistant", "tool":
+			return anchor
+		}
+	}
+	return anchor
+}
+
 func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	modelID := MapModel(req.Model)
 	origin := "AI_EDITOR"
@@ -1238,6 +1307,8 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 			nonSystemMessages = append(nonSystemMessages, msg)
 		}
 	}
+	taskAnchor := initialOpenAITaskAnchor(nonSystemMessages)
+	nonSystemMessages = coalesceConsecutiveOpenAIUserMessages(nonSystemMessages)
 
 	// 如果启用 thinking 模式，注入 thinking 提示
 	if thinking {
@@ -1397,6 +1468,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 
 	// 构建 payload
 	payload := &KiroPayload{}
+	payload.TaskAnchor = taskAnchor
 	payload.ConversationState.ChatTriggerType = "MANUAL"
 	payload.ConversationState.ConversationID = buildConversationID(modelID, systemPrompt, firstOpenAIConversationAnchor(nonSystemMessages))
 	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
@@ -1873,10 +1945,21 @@ func truncatePayloadToByteLimit(payload *KiroPayload, hasPriming bool, byteLimit
 
 	// The recent-turn preference is soft: if the model-specific limit is much
 	// smaller than the transport ceiling, continue dropping old tail entries.
-	// Then trim oversized system priming before touching the active user turn.
-	for payloadByteSize(payload) > byteLimit && len(payload.ConversationState.History) > primingCount {
+	// Keep the final assistant tool-use turn when the current message answers it;
+	// removing that turn would leave orphan toolResults that Kiro rejects as an
+	// improperly formed request. Then trim oversized system priming before
+	// touching the active user turn.
+	protectedTailCount := currentToolResultPairingTailCount(payload)
+	for payloadByteSize(payload) > byteLimit && len(payload.ConversationState.History) > primingCount+protectedTailCount {
 		history = payload.ConversationState.History
 		payload.ConversationState.History = append(history[:primingCount], history[primingCount+1:]...)
+	}
+	retainTaskAnchorInCurrentMessage(payload, primingCount)
+	if payloadByteSize(payload) > byteLimit {
+		fitCurrentToolResultsToByteLimit(payload, byteLimit)
+	}
+	if payloadByteSize(payload) > byteLimit {
+		fitCurrentImagesToByteLimit(payload, byteLimit)
 	}
 	if payloadByteSize(payload) > byteLimit && primingCount > 0 {
 		truncateHistoryUserMessage(payload, 0, byteLimit)
@@ -1884,6 +1967,7 @@ func truncatePayloadToByteLimit(payload *KiroPayload, hasPriming bool, byteLimit
 	if payloadByteSize(payload) > byteLimit {
 		truncateCurrentMessage(payload, byteLimit)
 	}
+	dropOrphanCurrentToolResults(payload)
 }
 
 // historyEntryByteSize returns the serialized size of a single history entry,
@@ -1914,6 +1998,112 @@ func payloadByteSize(payload *KiroPayload) int {
 	return len(raw)
 }
 
+func kiroPayloadImageStats(payload *KiroPayload) (count, encodedBytes int) {
+	if payload == nil {
+		return 0, 0
+	}
+	add := func(images []KiroImage) {
+		count += len(images)
+		for _, image := range images {
+			encodedBytes += len(image.Source.Bytes)
+		}
+	}
+	add(payload.ConversationState.CurrentMessage.UserInputMessage.Images)
+	for _, history := range payload.ConversationState.History {
+		if history.UserInputMessage != nil {
+			add(history.UserInputMessage.Images)
+		}
+	}
+	return count, encodedBytes
+}
+
+func kiroPayloadToolResultStats(payload *KiroPayload) (count, textBytes int) {
+	if payload == nil {
+		return 0, 0
+	}
+	add := func(toolResults []KiroToolResult) {
+		count += len(toolResults)
+		for _, result := range toolResults {
+			for _, content := range result.Content {
+				textBytes += len(content.Text)
+			}
+		}
+	}
+	current := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext
+	if current != nil {
+		add(current.ToolResults)
+	}
+	for _, history := range payload.ConversationState.History {
+		if history.UserInputMessage != nil && history.UserInputMessage.UserInputMessageContext != nil {
+			add(history.UserInputMessage.UserInputMessageContext.ToolResults)
+		}
+	}
+	return count, textBytes
+}
+
+func currentToolResultPairingTailCount(payload *KiroPayload) int {
+	if payload == nil {
+		return 0
+	}
+	current := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext
+	if current == nil || len(current.ToolResults) == 0 || len(payload.ConversationState.History) == 0 {
+		return 0
+	}
+	last := payload.ConversationState.History[len(payload.ConversationState.History)-1]
+	if last.AssistantResponseMessage == nil {
+		return 0
+	}
+	if toolResultsAnswerToolUses(last.AssistantResponseMessage.ToolUses, collectToolResultIDs(current.ToolResults)) {
+		return 1
+	}
+	return 0
+}
+
+func dropOrphanCurrentToolResults(payload *KiroPayload) {
+	if payload == nil {
+		return
+	}
+	current := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext
+	if current == nil || len(current.ToolResults) == 0 || currentToolResultPairingTailCount(payload) > 0 {
+		return
+	}
+	current.ToolResults = nil
+	if len(current.Tools) == 0 {
+		payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext = nil
+	}
+}
+
+func retainTaskAnchorInCurrentMessage(payload *KiroPayload, primingCount int) {
+	if payload == nil || strings.TrimSpace(payload.TaskAnchor) == "" {
+		return
+	}
+	current := &payload.ConversationState.CurrentMessage.UserInputMessage
+	context := current.UserInputMessageContext
+	isToolContinuation := context != nil && len(context.ToolResults) > 0
+	if len(current.Images) == 0 && !isToolContinuation {
+		return
+	}
+	anchor := strings.TrimSpace(payload.TaskAnchor)
+	for index, history := range payload.ConversationState.History {
+		if index < primingCount || history.UserInputMessage == nil {
+			continue
+		}
+		if strings.Contains(history.UserInputMessage.Content, anchor) {
+			return
+		}
+	}
+	if strings.Contains(current.Content, anchor) {
+		return
+	}
+	anchor = truncateUTF8Middle(anchor, maxTaskAnchorBytes)
+	latest := strings.TrimSpace(current.Content)
+	current.Content = taskAnchorPrefix + anchor
+	if latest != "" && latest != minimalFallbackUserContent {
+		current.Content += latestContextPrefix + latest
+	}
+	payload.TaskAnchorInjected = true
+}
+
 func currentMessageModelID(payload *KiroPayload) string {
 	return payload.ConversationState.CurrentMessage.UserInputMessage.ModelID
 }
@@ -1929,7 +2119,7 @@ func truncateCurrentMessage(payload *KiroPayload, byteLimit int) {
 		budget = 0
 	}
 	if len(cur.Content) > budget {
-		cur.Content = truncateUTF8Bytes(cur.Content, budget)
+		cur.Content = truncateUTF8Middle(cur.Content, budget)
 		if cur.Content == "" {
 			cur.Content = minimalFallbackUserContent
 		}
@@ -1945,8 +2135,10 @@ func truncateHistoryUserMessage(payload *KiroPayload, index, byteLimit int) {
 		return
 	}
 	overhead := payloadByteSize(payload) - len(message.Content)
-	budget := byteLimit - overhead
-	message.Content = truncateUTF8Bytes(message.Content, budget)
+	// Leave room for JSON escaping and delimiters so trimming system priming
+	// does not subsequently shave bytes from the active user request.
+	budget := byteLimit - overhead - 256
+	message.Content = truncateUTF8Middle(message.Content, budget)
 }
 
 func truncateUTF8Bytes(value string, budget int) string {
@@ -1961,6 +2153,250 @@ func truncateUTF8Bytes(value string, budget int) string {
 		cut--
 	}
 	return value[:cut]
+}
+
+func truncateUTF8Middle(value string, budget int) string {
+	if budget <= 0 {
+		return ""
+	}
+	if len(value) <= budget {
+		return value
+	}
+	if budget <= len(middleTruncationPlaceholder)+2 {
+		return truncateUTF8Bytes(value, budget)
+	}
+	contentBudget := budget - len(middleTruncationPlaceholder)
+	headBudget := contentBudget * 2 / 3
+	tailBudget := contentBudget - headBudget
+	head := truncateUTF8Bytes(value, headBudget)
+	tailStart := len(value) - tailBudget
+	for tailStart < len(value) && tailStart > 0 && !utf8.RuneStart(value[tailStart]) {
+		tailStart++
+	}
+	return head + middleTruncationPlaceholder + value[tailStart:]
+}
+
+func truncateToolResultText(value string, budget int) string {
+	if budget <= 0 {
+		return ""
+	}
+	if len(value) <= budget {
+		return value
+	}
+	if budget <= len(toolResultTruncationPlaceholder)+2 {
+		return truncateUTF8Bytes(toolResultTruncationPlaceholder, budget)
+	}
+	contentBudget := budget - len(toolResultTruncationPlaceholder)
+	headBudget := contentBudget * 2 / 3
+	tailBudget := contentBudget - headBudget
+	head := truncateUTF8Bytes(value, headBudget)
+	tailStart := len(value) - tailBudget
+	for tailStart < len(value) && tailStart > 0 && !utf8.RuneStart(value[tailStart]) {
+		tailStart++
+	}
+	return head + toolResultTruncationPlaceholder + value[tailStart:]
+}
+
+func fitCurrentToolResultsToByteLimit(payload *KiroPayload, byteLimit int) {
+	if payload == nil || payloadByteSize(payload) <= byteLimit {
+		return
+	}
+	context := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext
+	if context == nil || len(context.ToolResults) == 0 {
+		return
+	}
+
+	type toolResultText struct {
+		value    *string
+		original string
+	}
+	texts := make([]toolResultText, 0, len(context.ToolResults))
+	for resultIndex := range context.ToolResults {
+		result := &context.ToolResults[resultIndex]
+		if len(result.Content) == 0 {
+			result.Content = []KiroResultContent{{Text: toolResultTruncationPlaceholder}}
+		}
+		for contentIndex := range result.Content {
+			value := &result.Content[contentIndex].Text
+			texts = append(texts, toolResultText{value: value, original: *value})
+			*value = ""
+		}
+	}
+	if len(texts) == 0 {
+		return
+	}
+
+	available := byteLimit - payloadByteSize(payload) - 512
+	if available < 0 {
+		available = 0
+	}
+	perTextBudget := available / len(texts)
+	for _, text := range texts {
+		*text.value = truncateToolResultText(text.original, perTextBudget)
+	}
+
+	// JSON escaping can make the serialized text larger than its raw byte budget.
+	// Tighten the largest retained result until the actual request body fits.
+	for payloadByteSize(payload) > byteLimit {
+		largest := -1
+		for i := range texts {
+			if largest < 0 || len(*texts[i].value) > len(*texts[largest].value) {
+				largest = i
+			}
+		}
+		if largest < 0 || len(*texts[largest].value) == 0 {
+			break
+		}
+		over := payloadByteSize(payload) - byteLimit
+		budget := len(*texts[largest].value) - over - 256
+		if budget < 0 {
+			budget = 0
+		}
+		*texts[largest].value = truncateToolResultText(texts[largest].original, budget)
+	}
+}
+
+func fitCurrentImagesToByteLimit(payload *KiroPayload, byteLimit int) {
+	if payload == nil || payloadByteSize(payload) <= byteLimit {
+		return
+	}
+	current := &payload.ConversationState.CurrentMessage.UserInputMessage
+	if len(current.Images) == 0 {
+		return
+	}
+
+	originalCount := len(current.Images)
+	images := append([]KiroImage(nil), current.Images...)
+	current.Images = nil
+	fixedBytes := payloadByteSize(payload)
+	current.Images = images
+	available := byteLimit - fixedBytes - 2048
+	if available > 0 {
+		perImageBudget := available / len(images)
+		for i := range images {
+			images[i] = compressKiroImage(images[i], perImageBudget)
+		}
+		current.Images = images
+	}
+
+	for payloadByteSize(payload) > byteLimit && len(current.Images) > 0 {
+		current.Images = current.Images[:len(current.Images)-1]
+	}
+	if len(current.Images) < originalCount {
+		current.Content = strings.TrimSpace(current.Content) + imageOmissionPlaceholder
+	}
+}
+
+func compressKiroImage(source KiroImage, base64Budget int) KiroImage {
+	if base64Budget <= 0 || len(source.Source.Bytes) <= base64Budget {
+		return source
+	}
+	raw, err := decodeBase64Bytes(source.Source.Bytes)
+	if err != nil {
+		return source
+	}
+	decoded, _, err := image.Decode(bytes.NewReader(raw))
+	if err != nil {
+		return source
+	}
+
+	best := source
+	bestSize := len(source.Source.Bytes)
+	bounds := decoded.Bounds()
+	originalWidth, originalHeight := bounds.Dx(), bounds.Dy()
+	if originalWidth <= 0 || originalHeight <= 0 {
+		return source
+	}
+
+	initialScale := math.Sqrt(float64(base64Budget) / float64(bestSize))
+	if initialScale > 1 {
+		initialScale = 1
+	}
+	if initialScale < 0.15 {
+		initialScale = 0.15
+	}
+	opaque := imageIsOpaque(decoded)
+	for _, multiplier := range []float64{1, 0.8, 0.6, 0.45, 0.3} {
+		scale := initialScale * multiplier
+		width := maxInt(1, int(float64(originalWidth)*scale))
+		height := maxInt(1, int(float64(originalHeight)*scale))
+		resized := resizeImageNearest(decoded, width, height)
+		qualities := []int{78, 62, 48}
+		if !opaque {
+			qualities = []int{0}
+		}
+		for _, quality := range qualities {
+			candidate, ok := encodeKiroImage(resized, opaque, quality)
+			if !ok {
+				continue
+			}
+			candidateSize := len(candidate.Source.Bytes)
+			if candidateSize < bestSize {
+				best = candidate
+				bestSize = candidateSize
+			}
+			if candidateSize <= base64Budget {
+				return candidate
+			}
+		}
+	}
+	return best
+}
+
+func decodeBase64Bytes(value string) ([]byte, error) {
+	encodings := []*base64.Encoding{
+		base64.StdEncoding,
+		base64.RawStdEncoding,
+		base64.URLEncoding,
+		base64.RawURLEncoding,
+	}
+	var lastErr error
+	for _, encoding := range encodings {
+		decoded, err := encoding.DecodeString(value)
+		if err == nil {
+			return decoded, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
+func imageIsOpaque(source image.Image) bool {
+	if opaque, ok := source.(interface{ Opaque() bool }); ok {
+		return opaque.Opaque()
+	}
+	return false
+}
+
+func resizeImageNearest(source image.Image, width, height int) *image.NRGBA {
+	bounds := source.Bounds()
+	destination := image.NewNRGBA(image.Rect(0, 0, width, height))
+	for y := 0; y < height; y++ {
+		sourceY := bounds.Min.Y + y*bounds.Dy()/height
+		for x := 0; x < width; x++ {
+			sourceX := bounds.Min.X + x*bounds.Dx()/width
+			destination.Set(x, y, source.At(sourceX, sourceY))
+		}
+	}
+	return destination
+}
+
+func encodeKiroImage(source image.Image, opaque bool, jpegQuality int) (KiroImage, bool) {
+	var buffer bytes.Buffer
+	format := "png"
+	var err error
+	if opaque {
+		format = "jpeg"
+		err = jpeg.Encode(&buffer, source, &jpeg.Options{Quality: jpegQuality})
+	} else {
+		err = png.Encode(&buffer, source)
+	}
+	if err != nil {
+		return KiroImage{}, false
+	}
+	result := KiroImage{Format: format}
+	result.Source.Bytes = base64.StdEncoding.EncodeToString(buffer.Bytes())
+	return result, true
 }
 
 func buildToolResultsContinuation(toolResults []KiroToolResult) string {

@@ -195,6 +195,13 @@ type KiroPayload struct {
 	// in tool_use responses so the client can match them to its tool registry.
 	// Not serialized to the Kiro API request body.
 	ToolNameMap map[string]string `json:"-"`
+
+	// TaskAnchor keeps the user's original task available to the compactor. Codex
+	// sessions can attach several large images to a later tool result; if byte
+	// trimming drops the opening user turn, the model otherwise sees only those
+	// images and responds as though they were an unrelated upload.
+	TaskAnchor         string `json:"-"`
+	TaskAnchorInjected bool   `json:"-"`
 }
 
 type KiroUserInputMessage struct {

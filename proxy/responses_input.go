@@ -99,9 +99,9 @@ func convertResponsesInputItems(items []json.RawMessage) ([]OpenAIMessage, error
 			if callID == "" {
 				callID, _ = obj["tool_call_id"].(string)
 			}
-			out := stringifyArbitrary(obj["output"])
-			if out == "" {
-				out = stringifyArbitrary(obj["content"])
+			out := normalizeResponsesToolOutput(obj["output"])
+			if toolOutputIsEmpty(out) {
+				out = normalizeResponsesToolOutput(obj["content"])
 			}
 			messages = append(messages, OpenAIMessage{
 				Role:       "tool",
@@ -366,6 +366,32 @@ func stringifyArbitrary(v interface{}) string {
 			return ""
 		}
 		return string(b)
+	}
+}
+
+func normalizeResponsesToolOutput(value interface{}) interface{} {
+	switch value.(type) {
+	case nil:
+		return ""
+	case string, []interface{}, map[string]interface{}:
+		return value
+	default:
+		return stringifyArbitrary(value)
+	}
+}
+
+func toolOutputIsEmpty(value interface{}) bool {
+	switch typed := value.(type) {
+	case nil:
+		return true
+	case string:
+		return strings.TrimSpace(typed) == ""
+	case []interface{}:
+		return len(typed) == 0
+	case map[string]interface{}:
+		return len(typed) == 0
+	default:
+		return false
 	}
 }
 

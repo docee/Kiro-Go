@@ -733,6 +733,46 @@ func TestResponsesParseCustomToolCallRoundTrip(t *testing.T) {
 	}
 }
 
+func TestResponsesParseCustomToolOutputPreservesImageBlocks(t *testing.T) {
+	raw := json.RawMessage(`[
+		{"type":"message","role":"user","content":"inspect the design"},
+		{"type":"custom_tool_call","call_id":"call_view","name":"view_image","input":"reference.png"},
+		{"type":"custom_tool_call_output","call_id":"call_view","output":[
+			{"type":"input_text","text":"Viewed the reference image."},
+			{"type":"input_image","image_url":"data:image/png;base64,aGVsbG8="}
+		]}
+	]`)
+
+	msgs, err := parseResponsesInput(raw)
+	if err != nil {
+		t.Fatalf("parse custom image tool output: %v", err)
+	}
+	if len(msgs) != 3 || msgs[2].Role != "tool" {
+		t.Fatalf("expected tool result message, got %+v", msgs)
+	}
+	parts, ok := msgs[2].Content.([]interface{})
+	if !ok || len(parts) != 2 {
+		t.Fatalf("expected structured output parts, got %#v", msgs[2].Content)
+	}
+
+	req := &OpenAIRequest{Model: "gpt-5.6-sol", Messages: msgs}
+	payload := OpenAIToKiro(req, false)
+	current := payload.ConversationState.CurrentMessage.UserInputMessage
+	if len(current.Images) != 1 || current.Images[0].Source.Bytes != "aGVsbG8=" {
+		t.Fatalf("custom tool image was not converted to a Kiro image: %#v", current.Images)
+	}
+	if current.UserInputMessageContext == nil || len(current.UserInputMessageContext.ToolResults) != 1 {
+		t.Fatalf("expected matching structured tool result: %#v", current.UserInputMessageContext)
+	}
+	text := current.UserInputMessageContext.ToolResults[0].Content[0].Text
+	if text != "Viewed the reference image." {
+		t.Fatalf("tool result text = %q", text)
+	}
+	if strings.Contains(text, "data:image") || strings.Contains(text, "aGVsbG8=") {
+		t.Fatalf("image data leaked into tool-result text: %q", text)
+	}
+}
+
 // TestResponsesParseAgentMessage covers Codex's multi-agent v2 delivery of a
 // spawned sub-agent's initial task (and inter-agent messages) as an
 // "agent_message" item rather than a plain "message". Without this parsing

@@ -129,14 +129,26 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	openaiReq.Model = actualModel
 	roleCounts := countOpenAIRoles(finalMessages)
 	planMode := openAIRequestUsesPlanMode(openaiReq)
-	logger.Infof("[Responses] request method=%s path=%s model=%q mapped_model=%q stream=%t input_bytes=%d messages=%d roles=user:%d,assistant:%d,system:%d,developer:%d,tool:%d tools=%d tool_names=%q tool_choice=%q plan_mode=%t thinking=%t",
+	logger.Infof("[Responses] request method=%s path=%s model=%q mapped_model=%q stream=%t input_bytes=%d messages=%d roles=user:%d,assistant:%d,system:%d,developer:%d,tool:%d instruction_meta=%q tools=%d tool_names=%q tool_choice=%q plan_mode=%t thinking=%t",
 		r.Method, r.URL.Path, req.Model, actualModel, req.Stream, len(req.Input), len(finalMessages),
 		roleCounts["user"], roleCounts["assistant"], roleCounts["system"], roleCounts["developer"], roleCounts["tool"],
-		len(req.Tools), strings.Join(openAIToolNames(req.Tools), ","), summarizeToolChoice(openaiReq.ToolChoice), planMode, thinking)
+		openAIInstructionDiagnostics(finalMessages), len(req.Tools), strings.Join(openAIToolNames(req.Tools), ","), summarizeToolChoice(openaiReq.ToolChoice), planMode, thinking)
 
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(openaiReq)
 	kiroPayload := OpenAIToKiro(openaiReq, thinking)
-	truncatePayloadForModel(kiroPayload, h.getContextWindowSize(actualModel))
+	contextWindow := h.getContextWindowSize(actualModel)
+	payloadBytesBefore := payloadByteSize(kiroPayload)
+	imagesBefore, imageBytesBefore := kiroPayloadImageStats(kiroPayload)
+	toolResultsBefore, toolResultBytesBefore := kiroPayloadToolResultStats(kiroPayload)
+	truncatePayloadForModel(kiroPayload, contextWindow)
+	imagesAfter, imageBytesAfter := kiroPayloadImageStats(kiroPayload)
+	toolResultsAfter, toolResultBytesAfter := kiroPayloadToolResultStats(kiroPayload)
+	logger.Infof("[ResponsesPayload] model=%q plan_mode=%t context_window=%d payload_bytes=%d->%d history=%d current_text_bytes=%d task_anchor_bytes=%d task_anchor_injected=%t tool_results=%d/%d->%d/%d images=%d/%d->%d/%d truncated=%t",
+		actualModel, planMode, contextWindow, payloadBytesBefore, payloadByteSize(kiroPayload),
+		len(kiroPayload.ConversationState.History), len(kiroPayload.ConversationState.CurrentMessage.UserInputMessage.Content),
+		len(kiroPayload.TaskAnchor), kiroPayload.TaskAnchorInjected,
+		toolResultsBefore, toolResultBytesBefore, toolResultsAfter, toolResultBytesAfter,
+		imagesBefore, imageBytesBefore, imagesAfter, imageBytesAfter, payloadByteSize(kiroPayload) < payloadBytesBefore)
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	respID := generateResponseID()

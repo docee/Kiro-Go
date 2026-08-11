@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -25,24 +26,48 @@ const (
 
 var collaborationModeBlockPattern = regexp.MustCompile(`(?is)<collaboration_mode>.*?</collaboration_mode>`)
 
+type codexModeSignal struct {
+	mode     codexCollaborationMode
+	position int
+	strength int
+}
+
+var codexModePatterns = []struct {
+	mode     codexCollaborationMode
+	strength int
+	pattern  *regexp.Regexp
+}{
+	{codexModePlan, 3, regexp.MustCompile(`(?is)<collaboration_mode>\s*(?:#\s*)?collaboration\s+mode\s*:\s*plan\b`)},
+	{codexModeDefault, 3, regexp.MustCompile(`(?is)<collaboration_mode>\s*(?:#\s*)?collaboration\s+mode\s*:\s*default\b`)},
+	{codexModePlan, 3, regexp.MustCompile(`(?is)<collaboration_mode>\s*plan\s*</collaboration_mode>`)},
+	{codexModeDefault, 3, regexp.MustCompile(`(?is)<collaboration_mode>\s*default\s*</collaboration_mode>`)},
+	{codexModePlan, 2, regexp.MustCompile(`(?i)\bcollaboration\s+mode\s*:\s*plan\b`)},
+	{codexModeDefault, 2, regexp.MustCompile(`(?i)\bcollaboration\s+mode\s*:\s*default\b`)},
+	{codexModePlan, 2, regexp.MustCompile(`(?i)\byou\s+are\s+(?:now|currently)\s+in\s+plan\s+mode\b`)},
+	{codexModeDefault, 2, regexp.MustCompile(`(?i)\byou\s+are\s+(?:now|currently)\s+in\s+default\s+mode\b`)},
+	{codexModePlan, 2, regexp.MustCompile(`(?i)\b(?:the\s+)?current\s+(?:collaboration\s+)?mode\s*(?:is|:)\s*:?[ \t]*plan\b`)},
+	{codexModeDefault, 2, regexp.MustCompile(`(?i)\b(?:the\s+)?current\s+(?:collaboration\s+)?mode\s*(?:is|:)\s*:?[ \t]*default\b`)},
+	{codexModePlan, 1, regexp.MustCompile(`(?i)\bplan\s+mode\s+is\s+(?:now\s+)?active\b`)},
+	{codexModeDefault, 1, regexp.MustCompile(`(?i)\bdefault\s+mode\s+is\s+(?:now\s+)?active\b`)},
+}
+
+func strongestCodexModeSignal(prompt string) codexModeSignal {
+	best := codexModeSignal{position: -1}
+	for _, candidate := range codexModePatterns {
+		matches := candidate.pattern.FindAllStringIndex(prompt, -1)
+		for _, match := range matches {
+			signal := codexModeSignal{mode: candidate.mode, position: match[0], strength: candidate.strength}
+			if signal.strength > best.strength ||
+				(signal.strength == best.strength && signal.position > best.position) {
+				best = signal
+			}
+		}
+	}
+	return best
+}
+
 func codexModeFromText(prompt string) codexCollaborationMode {
-	lower := strings.ToLower(prompt)
-	planAt := strings.LastIndex(lower, "collaboration mode: plan")
-	defaultAt := strings.LastIndex(lower, "collaboration mode: default")
-	if direct := strings.LastIndex(lower, "<collaboration_mode>plan</collaboration_mode>"); direct > planAt {
-		planAt = direct
-	}
-	if direct := strings.LastIndex(lower, "<collaboration_mode>default</collaboration_mode>"); direct > defaultAt {
-		defaultAt = direct
-	}
-	switch {
-	case planAt < 0 && defaultAt < 0:
-		return codexModeUnknown
-	case defaultAt > planAt:
-		return codexModeDefault
-	default:
-		return codexModePlan
-	}
+	return strongestCodexModeSignal(prompt).mode
 }
 
 func isCodexPlanModePrompt(prompt string) bool {
@@ -50,18 +75,23 @@ func isCodexPlanModePrompt(prompt string) bool {
 }
 
 func resolveOpenAICollaborationMode(messages []OpenAIMessage) (codexCollaborationMode, int) {
-	mode := codexModeUnknown
+	best := codexModeSignal{position: -1}
 	latestIndex := -1
 	for i, message := range messages {
 		if message.Role != "system" && message.Role != "developer" {
 			continue
 		}
-		if candidate := codexModeFromText(extractOpenAIMessageText(message.Content)); candidate != codexModeUnknown {
-			mode = candidate
+		candidate := strongestCodexModeSignal(extractOpenAIMessageText(message.Content))
+		if candidate.mode == codexModeUnknown {
+			continue
+		}
+		if candidate.strength > best.strength ||
+			(candidate.strength == best.strength && i >= latestIndex) {
+			best = candidate
 			latestIndex = i
 		}
 	}
-	return mode, latestIndex
+	return best.mode, latestIndex
 }
 
 func stripCodexCollaborationModeBlocks(prompt string) string {
@@ -82,6 +112,22 @@ func openAIRequestUsesPlanMode(req *OpenAIRequest) bool {
 	}
 	mode, _ := resolveOpenAICollaborationMode(req.Messages)
 	return mode == codexModePlan
+}
+
+func openAIInstructionDiagnostics(messages []OpenAIMessage) string {
+	entries := make([]string, 0)
+	for i, message := range messages {
+		role := strings.ToLower(strings.TrimSpace(message.Role))
+		if role != "system" && role != "developer" {
+			continue
+		}
+		content := extractOpenAIMessageText(message.Content)
+		hash := sha256.Sum256([]byte(content))
+		signal := strongestCodexModeSignal(content)
+		entries = append(entries, fmt.Sprintf("%d:%s:%d:%x:%s/%d",
+			i, role, len(content), hash[:4], signal.mode, signal.strength))
+	}
+	return strings.Join(entries, ",")
 }
 
 // mergeOpenAITools combines tool declarations while keeping the first

@@ -169,6 +169,83 @@ func TestOpenAIToKiroLatestPlanModeSupersedesDefaultHistory(t *testing.T) {
 	}
 }
 
+func TestCodexModeFromTextRecognizesCurrentCodexPhrases(t *testing.T) {
+	for _, tc := range []struct {
+		text string
+		want codexCollaborationMode
+	}{
+		{"You are now in Plan mode.", codexModePlan},
+		{"The current collaboration mode is Plan.", codexModePlan},
+		{"Plan mode is active for this task.", codexModePlan},
+		{"You are currently in default mode.", codexModeDefault},
+		{"The current mode is: Default", codexModeDefault},
+	} {
+		if got := codexModeFromText(tc.text); got != tc.want {
+			t.Fatalf("codexModeFromText(%q) = %q, want %q", tc.text, got, tc.want)
+		}
+	}
+}
+
+func TestResolveModeIgnoresLaterGenericModeDocumentation(t *testing.T) {
+	messages := []OpenAIMessage{
+		{Role: "developer", Content: "<collaboration_mode># Collaboration Mode: Plan\nPlan safely.</collaboration_mode>"},
+		{Role: "developer", Content: "Known mode names are Default and Plan. User requests do not change modes."},
+	}
+	mode, index := resolveOpenAICollaborationMode(messages)
+	if mode != codexModePlan || index != 0 {
+		t.Fatalf("expected explicit Plan marker at index 0, got mode=%q index=%d", mode, index)
+	}
+}
+
+func TestInstructionDiagnosticsDoesNotIncludePromptContent(t *testing.T) {
+	messages := []OpenAIMessage{{Role: "developer", Content: "SECRET You are now in Plan mode."}}
+	diagnostic := openAIInstructionDiagnostics(messages)
+	if strings.Contains(diagnostic, "SECRET") {
+		t.Fatalf("diagnostic leaked prompt content: %q", diagnostic)
+	}
+	if !strings.Contains(diagnostic, ":plan/2") {
+		t.Fatalf("diagnostic omitted detected mode: %q", diagnostic)
+	}
+}
+
+func TestOpenAIToKiroCoalescesConsecutiveUserMessages(t *testing.T) {
+	image := KiroImage{Format: "png"}
+	image.Source.Bytes = "aGVsbG8="
+	req := &OpenAIRequest{
+		Model: "gpt-5.6-sol",
+		Messages: []OpenAIMessage{
+			{Role: "user", Content: []interface{}{
+				map[string]interface{}{"type": "input_text", "text": "full original requirements"},
+				map[string]interface{}{"type": "input_image", "image_url": "data:image/png;base64," + image.Source.Bytes},
+			}},
+			{Role: "user", Content: "use Plan mode"},
+		},
+	}
+	payload := OpenAIToKiro(req, false)
+	current := payload.ConversationState.CurrentMessage.UserInputMessage
+	if !strings.Contains(current.Content, "full original requirements") || !strings.Contains(current.Content, "use Plan mode") {
+		t.Fatalf("consecutive user messages were not coalesced: %q", current.Content)
+	}
+	if len(current.Images) != 1 {
+		t.Fatalf("expected original image on current task, got %d", len(current.Images))
+	}
+	if len(payload.ConversationState.History) != 0 {
+		t.Fatalf("consecutive user messages must not become trimmable history: %#v", payload.ConversationState.History)
+	}
+}
+
+func TestInitialOpenAITaskAnchorUsesLatestUserBeforeWorkStarts(t *testing.T) {
+	messages := []OpenAIMessage{
+		{Role: "user", Content: "workspace instructions"},
+		{Role: "user", Content: "actual player redesign request"},
+		{Role: "assistant", Content: "I will inspect the repository."},
+		{Role: "tool", Content: "tool output"},
+	}
+	if got := initialOpenAITaskAnchor(messages); got != "actual player redesign request" {
+		t.Fatalf("task anchor = %q", got)
+	}
+}
+
 func TestStoredResponseRoundTripsToolsAndToolChoice(t *testing.T) {
 	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
 		t.Fatalf("config.Init: %v", err)
