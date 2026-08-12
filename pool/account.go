@@ -170,6 +170,34 @@ func (p *AccountPool) GetModelList(accountID string) []string {
 	return ids
 }
 
+// ResolveSupportedModel keeps models that at least one Kiro account advertises
+// and redirects unsupported models to Luna. When no account model list has
+// been loaded yet, it preserves the requested model so cold-start routing
+// remains optimistic.
+func (p *AccountPool) ResolveSupportedModel(model string, thinking bool) string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	normalized := strings.ToLower(strings.TrimSpace(model))
+	hasModelList := false
+	for _, models := range p.modelLists {
+		if len(models) == 0 {
+			continue
+		}
+		hasModelList = true
+		if models[normalized] {
+			return model
+		}
+	}
+	if !hasModelList {
+		return model
+	}
+	if thinking {
+		return "gpt-5.6-luna-thinking"
+	}
+	return "gpt-5.6-luna"
+}
+
 // accountHasModel 检查账号是否支持指定模型。
 // 若该账号尚无模型列表（冷启动），视为支持所有模型。
 func (p *AccountPool) accountHasModel(accountID, model string) bool {

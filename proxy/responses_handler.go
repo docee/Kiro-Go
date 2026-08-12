@@ -126,7 +126,7 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	}
 
 	thinkingCfg := config.GetThinkingConfig()
-	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
+	actualModel, thinking := h.resolveModelAndThinking(req.Model, thinkingCfg.Suffix)
 	openaiReq.Model = actualModel
 	roleCounts := countOpenAIRoles(finalMessages)
 	planMode := openAIRequestUsesPlanMode(openaiReq)

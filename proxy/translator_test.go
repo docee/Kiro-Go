@@ -510,12 +510,13 @@ func TestParseModelAndThinking(t *testing.T) {
 		{"native Kiro gpt-5.6 terra", "gpt-5.6-terra", "gpt-5.6-terra", false},
 		{"native Kiro gpt-5.6 luna", "gpt-5.6-luna", "gpt-5.6-luna", false},
 		{"native Kiro gpt-5.6 luna thinking", "gpt-5.6-luna-thinking", "gpt-5.6-luna-thinking", true},
+		{"Codex frontier fallback", "gpt-5.4", "gpt-5.6-luna", false},
 		{"Codex researcher fallback", "gpt-5.4-mini", "gpt-5.6-luna", false},
 		{"Codex spark fallback", "gpt-5.3-codex-spark", "gpt-5.6-luna", false},
-		{"gpt-4-turbo", "gpt-4-turbo", "claude-sonnet-4.5", false},
-		{"gpt-4o", "gpt-4o", "claude-sonnet-4.5", false},
-		{"gpt-4", "gpt-4", "claude-sonnet-4.5", false},
-		{"gpt-3.5-turbo", "gpt-3.5-turbo", "claude-sonnet-4.5", false},
+		{"gpt-4-turbo", "gpt-4-turbo", "gpt-5.6-luna", false},
+		{"gpt-4o", "gpt-4o", "gpt-5.6-luna", false},
+		{"gpt-4", "gpt-4", "gpt-5.6-luna", false},
+		{"gpt-3.5-turbo", "gpt-3.5-turbo", "gpt-5.6-luna", false},
 
 		// Thinking suffix is stripped before mapping.
 		{"thinking suffix on dash form", "claude-opus-4-8-thinking", "claude-opus-4.8", true},

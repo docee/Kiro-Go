@@ -286,6 +286,28 @@ func TestGetNextForModelExcludingRoutesNativeKiroGPT56Model(t *testing.T) {
 	}
 }
 
+func TestResolveSupportedModelFallsBackToLuna(t *testing.T) {
+	p := newTestPool(config.Account{ID: "kiro", Enabled: true})
+	p.SetModelList("kiro", []string{"claude-sonnet-4.6", "gpt-5.6-luna", "gpt-5.6-luna-thinking"})
+
+	if got := p.ResolveSupportedModel("gpt-5.4", false); got != "gpt-5.6-luna" {
+		t.Fatalf("expected unsupported model to fall back to Luna, got %q", got)
+	}
+	if got := p.ResolveSupportedModel("future-model", true); got != "gpt-5.6-luna-thinking" {
+		t.Fatalf("expected unsupported thinking model to fall back to Luna thinking, got %q", got)
+	}
+	if got := p.ResolveSupportedModel("claude-sonnet-4.6", false); got != "claude-sonnet-4.6" {
+		t.Fatalf("expected advertised Kiro model to pass through, got %q", got)
+	}
+}
+
+func TestResolveSupportedModelPreservesColdStartRouting(t *testing.T) {
+	p := newTestPool(config.Account{ID: "kiro", Enabled: true})
+	if got := p.ResolveSupportedModel("future-model", false); got != "future-model" {
+		t.Fatalf("expected model to pass through before Kiro model lists load, got %q", got)
+	}
+}
+
 func TestRoutingDiagnosticsReportsModelMismatchWithoutCredentials(t *testing.T) {
 	p := newTestPool(config.Account{ID: "kiro-account", AccessToken: "secret-token", Enabled: true})
 	p.totalAccounts = 1

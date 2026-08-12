@@ -643,6 +643,13 @@ func (h *Handler) getContextWindowSize(model string) int {
 	return getContextWindowSize(wanted)
 }
 
+// resolveModelAndThinking applies static aliases first, then uses Kiro's
+// advertised per-account model lists to redirect any unsupported model to Luna.
+func (h *Handler) resolveModelAndThinking(model, thinkingSuffix string) (string, bool) {
+	actualModel, thinking := ParseModelAndThinking(model, thinkingSuffix)
+	return h.pool.ResolveSupportedModel(actualModel, thinking), thinking
+}
+
 // refreshModelsCache 从 Kiro API 拉取模型列表并缓存
 func (h *Handler) refreshModelsCache() {
 	accounts := config.GetEnabledAccounts()
@@ -1762,7 +1769,7 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 
 	// 解析模型和 thinking 模式
 	thinkingCfg := config.GetThinkingConfig()
-	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
+	actualModel, thinking := h.resolveModelAndThinking(req.Model, thinkingCfg.Suffix)
 	req.Model = actualModel
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(&req)
 
@@ -4197,7 +4204,7 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 
 	// Build a minimal chat payload
 	thinkingCfg := config.GetThinkingConfig()
-	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
+	actualModel, thinking := h.resolveModelAndThinking(req.Model, thinkingCfg.Suffix)
 
 	openaiReq := &OpenAIRequest{
 		Model:     actualModel,
