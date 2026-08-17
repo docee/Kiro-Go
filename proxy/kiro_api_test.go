@@ -341,8 +341,14 @@ func TestListKiroProfilesFollowsNextTokenPagination(t *testing.T) {
 	if len(profiles) != 2 || profiles[0].ARN == "" || profiles[1].ARN == "" {
 		t.Fatalf("profiles = %+v, want two ARNs across pages", profiles)
 	}
-	if !strings.Contains(pages[0], `"maxResults":50`) {
-		t.Fatalf("first page body = %s, want maxResults 50", pages[0])
+	if pages[0] != `{}` {
+		t.Fatalf("first page body = %s, want empty JSON object", pages[0])
+	}
+	if strings.Contains(pages[1], `"maxResults"`) {
+		t.Fatalf("second page body = %s, maxResults is rejected by the upstream API", pages[1])
+	}
+	if !strings.Contains(pages[1], `"nextToken":"page-2"`) {
+		t.Fatalf("second page body = %s, want nextToken", pages[1])
 	}
 }
 

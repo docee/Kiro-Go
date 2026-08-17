@@ -504,12 +504,12 @@ func listKiroProfilesInRegionContext(
 	seen := make(map[string]struct{})
 	invalidCount := 0
 	nextToken := ""
-	// Bound pagination so a misbehaving upstream cannot loop forever. 20 pages
-	// of 50 is far above any realistic Kiro profile count.
+	// Bound pagination so a misbehaving upstream cannot loop forever. The
+	// service currently rejects maxResults, so request the default page size and
+	// send only the continuation token on subsequent pages.
 	const maxProfilePages = 20
-	const pageSize = 50
 	for page := 0; page < maxProfilePages; page++ {
-		requestBody := map[string]interface{}{"maxResults": pageSize}
+		requestBody := make(map[string]interface{})
 		if nextToken != "" {
 			requestBody["nextToken"] = nextToken
 		}
