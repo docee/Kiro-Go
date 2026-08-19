@@ -20,7 +20,7 @@ import (
 //
 // Return contract:
 //   - nil: complete success only
-//   - transport error from CallKiroAPIContext: caller should rotate/ban as usual
+//   - non-integrity error from CallKiroAPIContext: caller should rotate/ban as usual
 //   - integrity error while still retryable: retries exhausted; caller should
 //     rotate account without treating it as an auth/quota failure
 //   - integrity error after client flush: caller must surface failure to the
@@ -48,12 +48,13 @@ func runKiroWithIntegrityRetry(
 		}
 
 		err := CallKiroAPIContext(ctx, account, payload, callback)
-		if err != nil {
+		integrityErr := err
+		if err == nil {
+			contentChars, toolCount, stopReason, sawReasoning := measure()
+			integrityErr = classifyStreamIntegrity(contentChars, toolCount, stopReason, sawReasoning)
+		} else if !isStreamIntegrityError(err) {
 			return err
 		}
-
-		contentChars, toolCount, stopReason, sawReasoning := measure()
-		integrityErr := classifyStreamIntegrity(contentChars, toolCount, stopReason, sawReasoning)
 		if integrityErr == nil {
 			return nil
 		}

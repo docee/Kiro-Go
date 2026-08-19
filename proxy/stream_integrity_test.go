@@ -158,6 +158,105 @@ func TestRunKiroWithIntegrityRetryRecoversTruncatedThenComplete(t *testing.T) {
 	}
 }
 
+// Incomplete tool JSON is also a stream-integrity failure. CallKiroAPIContext
+// first spends its same-invocation transport retry budget; the integrity layer
+// must then retry with a fresh invocation instead of leaking the parse error to
+// the client or treating the account as unhealthy.
+func TestRunKiroWithIntegrityRetryRecoversIncompleteToolWithFreshInvocation(t *testing.T) {
+	var hits atomic.Int32
+	var invocationIDs []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := hits.Add(1)
+		invocationIDs = append(invocationIDs, r.Header.Get("Amz-Sdk-Invocation-Id"))
+		w.WriteHeader(http.StatusOK)
+		input := `{"query":`
+		if n > int32(maxStreamAttemptsPerEndpoint) {
+			input = `{"query":"recovered"}`
+		}
+		_, _ = w.Write(awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
+			"toolUseId": "toolu_lookup",
+			"name":      "lookup",
+			"input":     input,
+			"stop":      true,
+		}))
+	}))
+	defer server.Close()
+	defer setupIntegrityTestUpstream(t, server)()
+
+	oldWait := streamRetryWait
+	streamRetryWait = func(context.Context, time.Duration) error { return nil }
+	defer func() { streamRetryWait = oldWait }()
+
+	var toolUses []KiroToolUse
+	var resets int
+	err := runKiroWithIntegrityRetry(context.Background(), integrityTestAccount(), integrityTestPayload(),
+		&KiroStreamCallback{OnToolUse: func(tu KiroToolUse) { toolUses = append(toolUses, tu) }},
+		func() (int, int, string, bool) { return 0, len(toolUses), "", false },
+		func() {
+			resets++
+			toolUses = nil
+		},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("expected recovery, got %v", err)
+	}
+	if got := hits.Load(); got != int32(maxStreamAttemptsPerEndpoint+1) {
+		t.Fatalf("upstream hits=%d, want %d", got, maxStreamAttemptsPerEndpoint+1)
+	}
+	if resets != 1 {
+		t.Fatalf("resets=%d, want 1", resets)
+	}
+	if len(toolUses) != 1 || toolUses[0].Input["query"] != "recovered" {
+		t.Fatalf("unexpected recovered tools: %#v", toolUses)
+	}
+	if len(invocationIDs) != maxStreamAttemptsPerEndpoint+1 ||
+		invocationIDs[0] == "" ||
+		invocationIDs[0] != invocationIDs[1] ||
+		invocationIDs[1] == invocationIDs[2] {
+		t.Fatalf("expected transport retries to share an invocation and integrity retry to use a fresh one: %q", invocationIDs)
+	}
+	if !isStreamIntegrityError(errIncompleteKiroToolInput) {
+		t.Fatal("incomplete tool input must be classified as a stream integrity error")
+	}
+}
+
+func TestRunKiroWithIntegrityRetryDoesNotReplayIncompleteToolAfterClientFlush(t *testing.T) {
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+			"content": "already visible",
+		}))
+		_, _ = w.Write(awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
+			"toolUseId": "toolu_lookup",
+			"name":      "lookup",
+			"input":     `{"query":`,
+			"stop":      true,
+		}))
+	}))
+	defer server.Close()
+	defer setupIntegrityTestUpstream(t, server)()
+
+	var content string
+	err := runKiroWithIntegrityRetry(context.Background(), integrityTestAccount(), integrityTestPayload(),
+		&KiroStreamCallback{OnText: func(s string, _ bool) { content += s }},
+		func() (int, int, string, bool) { return len(content), 0, "", false },
+		func() { content = "" },
+		func() bool { return content == "" },
+	)
+	if !errors.Is(err, errIncompleteKiroToolInput) {
+		t.Fatalf("expected incomplete tool error, got %v", err)
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("must not replay after client-visible output, hits=%d", hits.Load())
+	}
+	if content != "already visible" {
+		t.Fatalf("content=%q", content)
+	}
+}
+
 // Once the client has already been flushed, an incomplete stream must not be
 // retried (would duplicate output). Helper returns the integrity error so the
 // caller can emit an error event instead of forging a normal completion.

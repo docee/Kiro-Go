@@ -80,7 +80,8 @@ func classifyStreamIntegrity(contentChars, toolCallCount int, stopReason string,
 // Callers may rotate accounts on these, but must not run them through
 // handleAccountFailure: an upstream blip should not mark an account unhealthy.
 func isStreamIntegrityError(err error) bool {
-	return errors.Is(err, errUpstreamTruncatedResponse)
+	return errors.Is(err, errUpstreamTruncatedResponse) ||
+		errors.Is(err, errIncompleteKiroToolInput)
 }
 
 func isQuotaErrorMessage(msg string) bool {
