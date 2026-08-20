@@ -1222,6 +1222,76 @@
     }
   }
 
+  function buildCopilotConfig(models, origin) {
+    const endpoint = String(origin || '').replace(/\/$/, '') + '/v1/responses';
+    const availableModels = (Array.isArray(models) ? models : [])
+      .filter(model => model && String(model.modelId || '').trim())
+      .map(model => {
+        const id = String(model.modelId).trim();
+        const name = String(model.modelName || '').trim() || id;
+        const inputTypes = Array.isArray(model.supportedInputTypes) ? model.supportedInputTypes : [];
+        const vision = inputTypes.some(type => {
+          const normalized = String(type || '').toLowerCase();
+          return normalized.includes('image') || normalized.includes('vision');
+        });
+        const limits = model.tokenLimits || {};
+        const maxInputTokens = Number(limits.maxInputTokens);
+        const maxOutputTokens = Number(limits.maxOutputTokens);
+        return {
+          id,
+          name,
+          url: endpoint,
+          toolCalling: true,
+          vision,
+          maxInputTokens: maxInputTokens > 0 ? maxInputTokens : 128000,
+          maxOutputTokens: maxOutputTokens > 0 ? maxOutputTokens : 16000
+        };
+      })
+      .sort((a, b) => a.id.localeCompare(b.id));
+
+    return {
+      name: 'Kiro-Go',
+      vendor: 'customendpoint',
+      apiType: 'responses',
+      models: availableModels
+    };
+  }
+
+  async function showCopilotConfig(id) {
+    const title = $('apiViewTitle');
+    const body = $('apiViewBody');
+    title.textContent = t('copilot.title');
+    body.innerHTML = '<div class="api-view-loading"><i class="fa-solid fa-spinner fa-spin"></i> ' + escapeHtml(t('copilot.loading')) + '</div>';
+    openDialog('apiViewModal');
+
+    try {
+      const res = await api('/accounts/' + id + '/models');
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success || !Array.isArray(data.models)) {
+        throw new Error(data.error || ('HTTP ' + res.status));
+      }
+
+      const json = JSON.stringify(buildCopilotConfig(data.models, baseUrl), null, 2);
+      body.innerHTML =
+        '<div class="copilot-config-toolbar">' +
+        '<span class="api-view-count">' + escapeHtml(t('copilot.modelCount', data.models.filter(model => model && String(model.modelId || '').trim()).length)) + '</span>' +
+        '<button class="btn btn-outline btn-sm" id="copyCopilotConfigBtn" type="button"><i class="fa-solid fa-copy" aria-hidden="true"></i><span>' + escapeHtml(t('copilot.copy')) + '</span></button>' +
+        '</div>' +
+        '<pre class="copilot-config-json" tabindex="0"><code id="copilotConfigJson"></code></pre>';
+      $('copilotConfigJson').textContent = json;
+      $('copyCopilotConfigBtn').addEventListener('click', async () => {
+        try {
+          await copyText(json);
+          toast(t('copilot.copied'), 'primary');
+        } catch (e) {
+          toast(t('common.failed'), 'error');
+        }
+      });
+    } catch (e) {
+      body.innerHTML = '<div class="api-view-error"><i class="fa-solid fa-circle-exclamation"></i> ' + escapeHtml(t('copilot.loadFailed') + ': ' + e.message) + '</div>';
+    }
+  }
+
   // Detail modal
   function detailItem(label, value) {
     return '<div class="detail-item"><div class="detail-label">' + escapeHtml(label) + '</div><div class="detail-value">' + escapeHtml(value) + '</div></div>';
@@ -1288,6 +1358,7 @@
       '<h4>' + escapeHtml(t('detail.models')) +
       ' <button class="btn btn-sm btn-outline" data-detail-action="loadModels" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.loadModels')) + '</button>' +
       ' <button class="btn btn-sm btn-outline" data-detail-action="refreshModels" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.refreshModelCache')) + '</button>' +
+      ' <button class="btn btn-sm btn-outline" data-detail-action="copilotConfig" data-id="' + idAttr + '" type="button"><i class="fa-solid fa-code" aria-hidden="true"></i> ' + escapeHtml(t('copilot.button')) + '</button>' +
       '</h4>' +
       '<div id="modelsList" class="model-list"></div>' +
       '</div>';
@@ -3305,6 +3376,7 @@
       else if (a === 'saveProxyURL') saveProxyURL(id);
       else if (a === 'loadModels') loadModels(id);
       else if (a === 'refreshModels') refreshAccountModels(id);
+      else if (a === 'copilotConfig') showCopilotConfig(id);
     });
   }
 
