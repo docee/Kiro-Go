@@ -1306,7 +1306,12 @@ func initialOpenAITaskAnchor(messages []OpenAIMessage) string {
 func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	modelID := MapModel(req.Model)
 	origin := "AI_EDITOR"
-	effectiveTools, toolChoicePrompt := applyOpenAIToolChoice(req.Tools, req.ToolChoice)
+	activeMode, latestModeIndex := resolveOpenAICollaborationMode(req.Messages)
+	availableTools := req.Tools
+	if activeMode == codexModePlan {
+		availableTools = filterCodexPlanModeTools(availableTools)
+	}
+	effectiveTools, toolChoicePrompt := applyOpenAIToolChoice(availableTools, req.ToolChoice)
 
 	// Extract both system and developer instructions. The Responses API uses
 	// developer-role messages for Codex collaboration-mode rules (including
@@ -1314,7 +1319,6 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	// governing how those tools may be used.
 	var systemPrompt string
 	var nonSystemMessages []OpenAIMessage
-	activeMode, latestModeIndex := resolveOpenAICollaborationMode(req.Messages)
 	seenInstructions := make(map[string]bool)
 
 	for i, msg := range req.Messages {

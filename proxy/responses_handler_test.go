@@ -718,6 +718,175 @@ func TestResponsesPlanStreamNormalizesProposedPlanBlock(t *testing.T) {
 	}
 }
 
+func TestResponsesPlanModeDropsUnexpectedMutatingToolCall(t *testing.T) {
+	h, cleanup := setupResponsesTestHandler(t)
+	defer cleanup()
+
+	var captured map[string]interface{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+			t.Fatalf("decode upstream payload: %v", err)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+			"content": "<proposed_plan>\n- Inspect safely\n</proposed_plan>",
+		}))
+		_, _ = w.Write(awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
+			"toolUseId": "call_patch",
+			"name":      "apply_patch",
+			"input":     `{"patch":"*** Begin Patch"}`,
+			"stop":      true,
+		}))
+		_, _ = w.Write(awsEventStreamFrame(t, "metadataEvent", map[string]interface{}{
+			"stopReason": "tool_use",
+		}))
+	}))
+	defer server.Close()
+	defer swapKiroEndpointsForTest(t, server)()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model":"gpt-5.6-sol",
+		"instructions":"<collaboration_mode># Collaboration Mode: Plan</collaboration_mode>",
+		"input":"plan the change",
+		"store":false,
+		"tools":[
+			{"type":"custom","name":"exec","description":"Run commands"},
+			{"type":"function","name":"apply_patch","parameters":{"type":"object"}},
+			{"type":"function","name":"request_user_input","parameters":{"type":"object"}}
+		]
+	}`))
+	rec := httptest.NewRecorder()
+	h.handleOpenAIResponses(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	rawUpstream, _ := json.Marshal(captured)
+	if upstream := string(rawUpstream); strings.Contains(upstream, `"name":"exec"`) || strings.Contains(upstream, `"name":"apply_patch"`) {
+		t.Fatalf("mutating Plan-mode tools reached upstream: %s", upstream)
+	}
+	var response ResponsesObject
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v body=%s", err, rec.Body.String())
+	}
+	for _, item := range response.Output {
+		if item.Type == "function_call" || item.Type == "custom_tool_call" {
+			t.Fatalf("disallowed Plan-mode tool call leaked to client: %+v", item)
+		}
+	}
+}
+
+func TestResponsesPlanModeStreamDropsUnexpectedMutatingToolCall(t *testing.T) {
+	h, cleanup := setupResponsesTestHandler(t)
+	defer cleanup()
+
+	var captured map[string]interface{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+			t.Fatalf("decode upstream payload: %v", err)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+			"content": "<proposed_plan>\n- Inspect safely\n</proposed_plan>",
+		}))
+		_, _ = w.Write(awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
+			"toolUseId": "call_patch",
+			"name":      "apply_patch",
+			"input":     `{"patch":"*** Begin Patch"}`,
+			"stop":      true,
+		}))
+		_, _ = w.Write(awsEventStreamFrame(t, "metadataEvent", map[string]interface{}{
+			"stopReason": "tool_use",
+		}))
+	}))
+	defer server.Close()
+	defer swapKiroEndpointsForTest(t, server)()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model":"gpt-5.6-sol",
+		"instructions":"<collaboration_mode># Collaboration Mode: Plan</collaboration_mode>",
+		"input":"plan the change",
+		"stream":true,
+		"store":false,
+		"tools":[
+			{"type":"function","name":"apply_patch","parameters":{"type":"object"}},
+			{"type":"function","name":"request_user_input","parameters":{"type":"object"}}
+		]
+	}`))
+	rec := httptest.NewRecorder()
+	h.handleOpenAIResponses(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	rawUpstream, _ := json.Marshal(captured)
+	if upstream := string(rawUpstream); strings.Contains(upstream, `"name":"apply_patch"`) {
+		t.Fatalf("mutating Plan-mode tool reached upstream: %s", upstream)
+	}
+	body := rec.Body.String()
+	for _, forbidden := range []string{
+		"response.function_call_arguments.delta",
+		`"type":"function_call"`,
+		`"type":"custom_tool_call"`,
+	} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("disallowed Plan-mode tool call leaked into stream as %q:\n%s", forbidden, body)
+		}
+	}
+}
+
+func TestOpenAIChatPlanModeDropsUnexpectedMutatingToolCall(t *testing.T) {
+	h, cleanup := setupResponsesTestHandler(t)
+	defer cleanup()
+
+	var captured map[string]interface{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+			t.Fatalf("decode upstream payload: %v", err)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+			"content": "<proposed_plan>\n- Inspect safely\n</proposed_plan>",
+		}))
+		_, _ = w.Write(awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
+			"toolUseId": "call_patch",
+			"name":      "apply_patch",
+			"input":     `{"patch":"*** Begin Patch"}`,
+			"stop":      true,
+		}))
+		_, _ = w.Write(awsEventStreamFrame(t, "metadataEvent", map[string]interface{}{
+			"stopReason": "tool_use",
+		}))
+	}))
+	defer server.Close()
+	defer swapKiroEndpointsForTest(t, server)()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+		"model":"gpt-5.6-sol",
+		"messages":[
+			{"role":"developer","content":"<collaboration_mode># Collaboration Mode: Plan</collaboration_mode>"},
+			{"role":"user","content":"plan the change"}
+		],
+		"tools":[
+			{"type":"function","function":{"name":"apply_patch","parameters":{"type":"object"}}},
+			{"type":"function","function":{"name":"request_user_input","parameters":{"type":"object"}}}
+		]
+	}`))
+	rec := httptest.NewRecorder()
+	h.handleOpenAIChat(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	rawUpstream, _ := json.Marshal(captured)
+	if upstream := string(rawUpstream); strings.Contains(upstream, `"name":"apply_patch"`) {
+		t.Fatalf("mutating Plan-mode tool reached upstream: %s", upstream)
+	}
+	if strings.Contains(rec.Body.String(), `"tool_calls"`) {
+		t.Fatalf("disallowed Plan-mode tool call leaked to Chat client: %s", rec.Body.String())
+	}
+}
+
 // TestExtractResponsesToolsAdditionalTools covers newer Codex clients
 // (v0.146+) that stop sending the top-level "tools" field and instead embed
 // every tool -- including Codex's own built-in "exec" custom tool that

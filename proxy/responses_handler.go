@@ -200,7 +200,13 @@ func (h *Handler) handleResponsesNonStream(
 					content += text
 				}
 			},
-			OnToolUse:  func(tu KiroToolUse) { toolUses = append(toolUses, tu) },
+			OnToolUse: func(tu KiroToolUse) {
+				if planMode && !codexPlanModeAllowsTool(tu.Name) {
+					logger.Warnf("[Responses] blocked disallowed Plan-mode tool call name=%q", tu.Name)
+					return
+				}
+				toolUses = append(toolUses, tu)
+			},
 			OnComplete: func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
 			OnCredits:  func(c float64) { credits = c },
 			OnContextUsage: func(pct float64) {
@@ -560,6 +566,10 @@ func (h *Handler) handleResponsesStream(
 				emitVisibleText(text)
 			},
 			OnToolUse: func(tu KiroToolUse) {
+				if planMode && !codexPlanModeAllowsTool(tu.Name) {
+					logger.Warnf("[Responses] blocked disallowed Plan-mode tool call name=%q", tu.Name)
+					return
+				}
 				if pendingPlanText.Len() > 0 {
 					emitVisibleText(pendingPlanText.String())
 					pendingPlanText.Reset()

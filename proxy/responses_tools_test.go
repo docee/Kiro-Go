@@ -119,6 +119,54 @@ func TestOpenAIToKiroReinforcesCodexPlanMode(t *testing.T) {
 	}
 }
 
+func TestOpenAIToKiroPlanModeOnlyExposesReadOnlyTools(t *testing.T) {
+	req := &OpenAIRequest{
+		Model: "gpt-5.6-sol",
+		Messages: []OpenAIMessage{
+			{Role: "developer", Content: "<collaboration_mode># Collaboration Mode: Plan</collaboration_mode>"},
+			{Role: "user", Content: "Inspect the repository and propose a plan"},
+		},
+		Tools: []OpenAITool{
+			testOpenAITool("exec", ""),
+			testOpenAITool("exec_command", "functions"),
+			testOpenAITool("apply_patch", "functions"),
+			testOpenAITool("request_user_input", "functions"),
+			testOpenAITool("read_mcp_resource", "functions"),
+			testOpenAITool("unknown_tool", "functions"),
+		},
+	}
+
+	payload := OpenAIToKiro(req, false)
+	ctx := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext
+	if ctx == nil {
+		t.Fatal("expected allowed Plan-mode tools")
+	}
+	got := make([]string, 0, len(ctx.Tools))
+	for _, tool := range ctx.Tools {
+		got = append(got, tool.ToolSpecification.Name)
+	}
+	if strings.Join(got, ",") != "request_user_input,read_mcp_resource" {
+		t.Fatalf("Plan-mode tools = %v, want only explicit read-only tools", got)
+	}
+}
+
+func TestOpenAIToKiroDefaultModeKeepsMutatingTools(t *testing.T) {
+	req := &OpenAIRequest{
+		Model: "gpt-5.6-sol",
+		Messages: []OpenAIMessage{
+			{Role: "developer", Content: "<collaboration_mode># Collaboration Mode: Default</collaboration_mode>"},
+			{Role: "user", Content: "Implement the change"},
+		},
+		Tools: []OpenAITool{testOpenAITool("exec", ""), testOpenAITool("apply_patch", "functions")},
+	}
+
+	payload := OpenAIToKiro(req, false)
+	ctx := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext
+	if ctx == nil || len(ctx.Tools) != 2 {
+		t.Fatalf("Default mode must keep requested tools, got %#v", ctx)
+	}
+}
+
 func TestNormalizeCodexProposedPlanDropsTextOutsideBlock(t *testing.T) {
 	raw := "Plan is ready. <proposed_plan>\r\n# Title\n\n- Change\n</proposed_plan> trailing note"
 	got, ok := normalizeCodexProposedPlan(raw)

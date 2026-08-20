@@ -118,6 +118,34 @@ func openAIRequestUsesPlanMode(req *OpenAIRequest) bool {
 	return mode == codexModePlan
 }
 
+var codexPlanModeAllowedTools = map[string]bool{
+	"request_user_input":          true,
+	"list_mcp_resources":          true,
+	"list_mcp_resource_templates": true,
+	"read_mcp_resource":           true,
+	"codegraph_explore":           true,
+}
+
+// codexPlanModeAllowsTool is deliberately an allowlist. Generic execution
+// tools such as exec can invoke shell, patch, and other mutating tools through
+// nested JavaScript, so their inputs cannot be proven read-only here.
+func codexPlanModeAllowsTool(name string) bool {
+	return codexPlanModeAllowedTools[strings.ToLower(strings.TrimSpace(name))]
+}
+
+func filterCodexPlanModeTools(tools []OpenAITool) []OpenAITool {
+	if len(tools) == 0 {
+		return nil
+	}
+	filtered := make([]OpenAITool, 0, len(tools))
+	for _, tool := range tools {
+		if codexPlanModeAllowsTool(tool.Function.Name) {
+			filtered = append(filtered, tool)
+		}
+	}
+	return filtered
+}
+
 func openAIPlanModeContinuesAfterUserInput(messages []OpenAIMessage) bool {
 	last := len(messages) - 1
 	for last >= 0 && (messages[last].Role == "system" || messages[last].Role == "developer") {
