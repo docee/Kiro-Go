@@ -102,8 +102,10 @@ func GetClientForProxy(proxyURL string) *http.Client {
 	if cached, ok := proxyClientCache.Load(proxyURL); ok {
 		return cached.(*http.Client)
 	}
+	// Streaming generations may legitimately run for more than five minutes.
+	// Leave Client.Timeout at zero so the request context, rather than a wall
+	// clock limit that includes response-body reads, controls cancellation.
 	client := &http.Client{
-		Timeout:   5 * time.Minute,
 		Transport: buildKiroTransport(proxyURL),
 	}
 	proxyClientCache.Store(proxyURL, client)
@@ -160,8 +162,10 @@ func buildKiroTransport(proxyURL string) *http.Transport {
 
 // InitKiroHttpClient initializes (or reinitializes) the HTTP clients used for Kiro API requests.
 func InitKiroHttpClient(proxyURL string) {
+	// Do not set Client.Timeout for the event stream. A total HTTP timeout also
+	// covers response-body reads and would cut off an otherwise healthy long
+	// generation mid-response. Callers already attach a cancellable context.
 	client := &http.Client{
-		Timeout:   5 * time.Minute,
 		Transport: buildKiroTransport(proxyURL),
 	}
 	kiroHttpStore.Store(client)

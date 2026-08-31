@@ -313,18 +313,29 @@ func TestBuildKiroTransportFallsBackToEnvironmentProxy(t *testing.T) {
 	assertProxyURL(t, got, "http://env-proxy.local:2323")
 }
 
-func TestInitKiroHttpClientKeepsShortRestTimeout(t *testing.T) {
+func TestInitKiroHttpClientDoesNotLimitStreamingDuration(t *testing.T) {
 	InitKiroHttpClient("")
 	t.Cleanup(func() { InitKiroHttpClient("") })
 
 	streamClient := kiroHttpStore.Load()
 	restClient := kiroRestHttpStore.Load()
 
-	if streamClient.Timeout != 5*time.Minute {
-		t.Fatalf("expected streaming timeout to be 5m, got %s", streamClient.Timeout)
+	if streamClient.Timeout != 0 {
+		t.Fatalf("expected streaming client to have no total timeout, got %s", streamClient.Timeout)
 	}
 	if restClient.Timeout != 30*time.Second {
 		t.Fatalf("expected REST timeout to stay 30s, got %s", restClient.Timeout)
+	}
+}
+
+func TestProxiedKiroClientDoesNotLimitStreamingDuration(t *testing.T) {
+	proxyURL := "http://proxy.example:8080"
+	proxyClientCache.Delete(proxyURL)
+	t.Cleanup(func() { proxyClientCache.Delete(proxyURL) })
+
+	client := GetClientForProxy(proxyURL)
+	if client.Timeout != 0 {
+		t.Fatalf("expected proxied streaming client to have no total timeout, got %s", client.Timeout)
 	}
 }
 
