@@ -35,11 +35,14 @@ const (
 	maxEventStreamMessageSize    = 16 * 1024 * 1024
 )
 
+var kiroStreamIdleTimeout = 2 * time.Minute
+
 var (
 	errEmptyKiroStream         = errors.New("upstream stream ended before any output")
 	errIncompleteKiroToolInput = errors.New("upstream stream ended with incomplete tool input")
 	errInvalidKiroEventStream  = errors.New("invalid upstream event stream")
 	errKiroEventStreamUpstream = errors.New("upstream event stream error")
+	errKiroStreamIdleTimeout   = errors.New("upstream stream idle timeout")
 	streamRetryWait            = waitForStreamRetry
 	resolveKiroEndpoints       = endpointsForAccount
 )
@@ -142,11 +145,12 @@ func ResolveAccountProxyURL(account *config.Account) string {
 // buildKiroTransport constructs an HTTP Transport with optional outbound proxy support.
 func buildKiroTransport(proxyURL string) *http.Transport {
 	t := &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 20,
-		IdleConnTimeout:     90 * time.Second,
-		DisableCompression:  false,
-		ForceAttemptHTTP2:   true,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   20,
+		IdleConnTimeout:       90 * time.Second,
+		ResponseHeaderTimeout: kiroStreamIdleTimeout,
+		DisableCompression:    false,
+		ForceAttemptHTTP2:     true,
 	}
 	if proxyURL != "" {
 		if u, err := url.Parse(proxyURL); err == nil {
@@ -473,6 +477,9 @@ endpointLoop:
 
 			resp, err := GetClientForProxy(ResolveAccountProxyURL(account)).Do(req)
 			if err != nil {
+				if ctx.Err() == nil && strings.Contains(strings.ToLower(err.Error()), "timeout awaiting response headers") {
+					err = fmt.Errorf("%w while waiting for upstream response: %v", errKiroStreamIdleTimeout, err)
+				}
 				lastErr = err
 				logger.Warnf("[KiroAPI] Endpoint %s failed: %v", ep.Name, err)
 				if !isRetryableStreamError(err) {
@@ -500,7 +507,7 @@ endpointLoop:
 				continue endpointLoop
 			}
 
-			emitted, err := parseEventStreamTracked(resp.Body, callback)
+			emitted, err := parseEventStreamTrackedWithIdleTimeout(ctx, resp.Body, callback)
 			resp.Body.Close()
 			if err == nil {
 				return nil
@@ -543,8 +550,85 @@ endpointLoop:
 	return fmt.Errorf("all endpoints failed")
 }
 
+type streamActivityReader struct {
+	reader   io.Reader
+	activity chan<- struct{}
+}
+
+func (r *streamActivityReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	if n > 0 {
+		select {
+		case r.activity <- struct{}{}:
+		default:
+		}
+	}
+	return n, err
+}
+
+// parseEventStreamTrackedWithIdleTimeout limits only periods with no upstream
+// bytes. Unlike http.Client.Timeout, it does not cap the total generation time.
+func parseEventStreamTrackedWithIdleTimeout(ctx context.Context, body io.ReadCloser, callback *KiroStreamCallback) (bool, error) {
+	timeout := kiroStreamIdleTimeout
+	if timeout <= 0 {
+		return parseEventStreamTracked(body, callback)
+	}
+
+	activity := make(chan struct{}, 1)
+	done := make(chan struct{})
+	watcherDone := make(chan struct{})
+	var timedOut atomic.Bool
+	var finished atomic.Bool
+
+	go func() {
+		defer close(watcherDone)
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		for {
+			select {
+			case <-activity:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(timeout)
+			case <-timer.C:
+				if !finished.Load() {
+					timedOut.Store(true)
+					_ = body.Close()
+				}
+				return
+			case <-done:
+				return
+			case <-ctx.Done():
+				if !finished.Load() {
+					_ = body.Close()
+				}
+				return
+			}
+		}
+	}()
+
+	emitted, err := parseEventStreamTracked(&streamActivityReader{reader: body, activity: activity}, callback)
+	finished.Store(true)
+	close(done)
+	<-watcherDone
+	if timedOut.Load() {
+		return emitted, errKiroStreamIdleTimeout
+	}
+	return emitted, err
+}
+
 func isRetryableStreamError(err error) bool {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	// The higher-level account failover path handles an idle stream. Retrying
+	// the same endpoint here would multiply the full idle window before the
+	// request can move to another account.
+	if errors.Is(err, errKiroStreamIdleTimeout) {
 		return false
 	}
 	var netErr net.Error

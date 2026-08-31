@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"kiro-go/config"
 	"kiro-go/logger"
 )
@@ -57,6 +58,13 @@ func runKiroWithIntegrityRetry(
 		}
 		if integrityErr == nil {
 			return nil
+		}
+		// A full idle window already distinguishes this from a brief transport
+		// blip. Return immediately so the caller can rotate accounts instead of
+		// waiting through the same idle window repeatedly on one account.
+		if errors.Is(integrityErr, errKiroStreamIdleTimeout) {
+			logger.Warnf("[StreamIntegrity] %v on %s; rotating account", integrityErr, label)
+			return integrityErr
 		}
 
 		// A canceled client is not an integrity failure: the turn is over and

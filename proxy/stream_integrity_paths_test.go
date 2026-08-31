@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // setupIntegrityPathTest installs a single-account config plus a fake upstream
@@ -87,6 +88,124 @@ func TestClaudeStreamEmitsErrorOnTruncatedStream(t *testing.T) {
 	// Content was already flushed, so reissuing would duplicate output.
 	if hits.Load() != 1 {
 		t.Fatalf("must not retry after client flush, hits=%d", hits.Load())
+	}
+}
+
+func TestClaudeStreamSendsHeartbeatWhileWaitingForUpstream(t *testing.T) {
+	oldInterval := claudeSSEHeartbeatInterval
+	claudeSSEHeartbeatInterval = 5 * time.Millisecond
+	t.Cleanup(func() { claudeSSEHeartbeatInterval = oldInterval })
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(30 * time.Millisecond)
+		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+			"content": "eventual answer",
+		}))
+		_, _ = w.Write(awsEventStreamFrame(t, "metadataEvent", map[string]interface{}{
+			"stopReason": "end_turn",
+		}))
+	}))
+	defer server.Close()
+	h := setupIntegrityPathTest(t, server)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
+		"model":"claude-sonnet-4.5",
+		"max_tokens":100,
+		"messages":[{"role":"user","content":"hello"}],
+		"stream":true
+	}`))
+	rec := httptest.NewRecorder()
+	h.handleClaudeMessages(rec, req)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "event: ping\ndata: {\"type\":\"ping\"}\n\n") {
+		t.Fatalf("expected SSE heartbeat while upstream was silent, got %s", body)
+	}
+	if strings.Index(body, "event: message_start") > strings.Index(body, "event: ping") {
+		t.Fatalf("message_start must precede ping events, got %s", body)
+	}
+	if !strings.Contains(body, "eventual answer") || !strings.Contains(body, "event: message_stop") {
+		t.Fatalf("heartbeat must not prevent normal stream completion, got %s", body)
+	}
+}
+
+func TestClaudeStreamRotatesAfterOneIdleWindowPerAccount(t *testing.T) {
+	oldIdleTimeout := kiroStreamIdleTimeout
+	oldHeartbeatInterval := claudeSSEHeartbeatInterval
+	kiroStreamIdleTimeout = 20 * time.Millisecond
+	claudeSSEHeartbeatInterval = 0
+	t.Cleanup(func() {
+		kiroStreamIdleTimeout = oldIdleTimeout
+		claudeSSEHeartbeatInterval = oldHeartbeatInterval
+	})
+
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+	h := setupIntegrityPathTest(t, server)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
+		"model":"claude-sonnet-4.5",
+		"max_tokens":100,
+		"messages":[{"role":"user","content":"hello"}],
+		"stream":true
+	}`))
+	rec := httptest.NewRecorder()
+	h.handleClaudeMessages(rec, req)
+
+	if hits.Load() != 1 {
+		t.Fatalf("idle upstream must be attempted once per account, hits=%d", hits.Load())
+	}
+	if !strings.Contains(rec.Body.String(), "upstream stream idle timeout") {
+		t.Fatalf("expected idle timeout error, got %s", rec.Body.String())
+	}
+}
+
+func TestClaudeStreamTimesOutWhenUpstreamWithholdsHeaders(t *testing.T) {
+	oldIdleTimeout := kiroStreamIdleTimeout
+	oldHeartbeatInterval := claudeSSEHeartbeatInterval
+	kiroStreamIdleTimeout = 20 * time.Millisecond
+	claudeSSEHeartbeatInterval = 0
+	t.Cleanup(func() {
+		kiroStreamIdleTimeout = oldIdleTimeout
+		claudeSSEHeartbeatInterval = oldHeartbeatInterval
+	})
+
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		time.Sleep(100 * time.Millisecond)
+		_, _ = w.Write([]byte("late"))
+	}))
+	defer server.Close()
+	h := setupIntegrityPathTest(t, server)
+	testClient := kiroHttpStore.Load()
+	kiroHttpStore.Store(&http.Client{Transport: &http.Transport{
+		ResponseHeaderTimeout: kiroStreamIdleTimeout,
+	}})
+	t.Cleanup(func() { kiroHttpStore.Store(testClient) })
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
+		"model":"claude-sonnet-4.5",
+		"max_tokens":100,
+		"messages":[{"role":"user","content":"hello"}],
+		"stream":true
+	}`))
+	rec := httptest.NewRecorder()
+	h.handleClaudeMessages(rec, req)
+
+	if hits.Load() != 1 {
+		t.Fatalf("header timeout must be attempted once per account, hits=%d", hits.Load())
+	}
+	if !strings.Contains(rec.Body.String(), "upstream stream idle timeout") {
+		t.Fatalf("expected response-header idle timeout, got %s", rec.Body.String())
 	}
 }
 

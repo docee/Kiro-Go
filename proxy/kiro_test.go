@@ -476,6 +476,30 @@ func TestParseEventStreamTrackedReportsNoEmissionOnEarlyFailure(t *testing.T) {
 	}
 }
 
+func TestParseEventStreamTrackedTimesOutOnUpstreamSilence(t *testing.T) {
+	oldTimeout := kiroStreamIdleTimeout
+	kiroStreamIdleTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { kiroStreamIdleTimeout = oldTimeout })
+
+	reader, writer := io.Pipe()
+	t.Cleanup(func() { _ = writer.Close() })
+
+	started := time.Now()
+	emitted, err := parseEventStreamTrackedWithIdleTimeout(context.Background(), reader, &KiroStreamCallback{})
+	if !errors.Is(err, errKiroStreamIdleTimeout) {
+		t.Fatalf("expected upstream idle timeout, got %v", err)
+	}
+	if emitted {
+		t.Fatal("an idle stream must not report emitted output")
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("idle timeout took too long: %s", elapsed)
+	}
+	if !isStreamIntegrityError(err) {
+		t.Fatal("upstream idle timeout must be treated as a soft integrity failure")
+	}
+}
+
 func TestParseEventStreamTrackedReportsEmissionAfterText(t *testing.T) {
 	// One complete text frame, then the connection dies.
 	frame := awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
