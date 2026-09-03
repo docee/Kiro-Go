@@ -264,13 +264,13 @@ defineProvider({
       return count;
     }
 
-    function busiestDay(rows) {
+    function busiestCreditDay(rows) {
       var best = null;
       for (var d = 0; d < rows.length; d += 1) {
-        if (best === null || rows[d].totalTokens > best.totalTokens) best = rows[d];
+        if (best === null || rows[d].credits > best.credits) best = rows[d];
       }
-      if (best === null || best.totalTokens === 0) return "暂无用量";
-      return best.date + "  " + numberText(best.totalTokens, 0);
+      if (best === null || best.credits === 0) return "暂无用量";
+      return best.date + "  " + numberText(best.credits, 3) + " Credit";
     }
 
     // CodexBar exposes two top-level ratio bars. The aggregate account-pool
@@ -385,9 +385,9 @@ defineProvider({
       {
         title: "每日活动",
         rows: [
-          { label: "用量最高日", value: busiestDay(daily) },
+          { label: "用量最高日", value: busiestCreditDay(daily) },
           { label: "活跃天数", value: numberText(activeDays(daily), 0) + " / " + rangeDays + " 天" },
-          { label: "日均 Token", value: numberText(Math.round(totals.totalTokens / Math.max(1, rangeDays)), 0) },
+          { label: "日均 Credit", value: numberText(totals.credits / Math.max(1, rangeDays), 3) },
         ],
         chart: { kind: "bars", title: "每日请求数", unit: "次", points: requestPoints },
       },
