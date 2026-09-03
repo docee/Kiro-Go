@@ -899,11 +899,113 @@ func ensureObjectSchema(schema interface{}) interface{} {
 		return map[string]interface{}{"type": "object"}
 	}
 	cleaned := cloneSchemaMap(m)
+	flattenTopLevelSchemaCompositions(cleaned)
 	cleanSchema(cleaned)
 	if _, hasType := cleaned["type"]; !hasType {
 		cleaned["type"] = "object"
 	}
 	return cleaned
+}
+
+// Amazon Q requires a plain object at the root of a tool input schema. Keep
+// the fields declared by root-level composition branches, but relax union
+// constraints that cannot be represented without a root oneOf/anyOf.
+func flattenTopLevelSchemaCompositions(schema map[string]interface{}) {
+	for _, keyword := range []string{"allOf", "anyOf", "oneOf"} {
+		raw, exists := schema[keyword]
+		if !exists {
+			continue
+		}
+		delete(schema, keyword)
+
+		branches, ok := raw.([]interface{})
+		if !ok || len(branches) == 0 {
+			continue
+		}
+
+		var commonRequired map[string]struct{}
+		for i, rawBranch := range branches {
+			branch, ok := rawBranch.(map[string]interface{})
+			if !ok {
+				if keyword != "allOf" {
+					commonRequired = map[string]struct{}{}
+				}
+				continue
+			}
+
+			mergeSchemaProperties(schema, branch)
+			required := schemaRequiredSet(branch["required"])
+			if keyword == "allOf" {
+				mergeSchemaRequired(schema, required)
+				continue
+			}
+
+			if i == 0 {
+				commonRequired = required
+			} else {
+				for name := range commonRequired {
+					if _, present := required[name]; !present {
+						delete(commonRequired, name)
+					}
+				}
+			}
+		}
+
+		if keyword != "allOf" {
+			mergeSchemaRequired(schema, commonRequired)
+		}
+	}
+}
+
+func mergeSchemaProperties(target, branch map[string]interface{}) {
+	branchProperties, ok := branch["properties"].(map[string]interface{})
+	if !ok || len(branchProperties) == 0 {
+		return
+	}
+	targetProperties, ok := target["properties"].(map[string]interface{})
+	if !ok {
+		targetProperties = make(map[string]interface{}, len(branchProperties))
+		target["properties"] = targetProperties
+	}
+	for name, property := range branchProperties {
+		if _, exists := targetProperties[name]; !exists {
+			targetProperties[name] = cloneSchemaValue(property)
+		}
+	}
+}
+
+func schemaRequiredSet(raw interface{}) map[string]struct{} {
+	required := make(map[string]struct{})
+	switch values := raw.(type) {
+	case []interface{}:
+		for _, value := range values {
+			if name, ok := value.(string); ok && name != "" {
+				required[name] = struct{}{}
+			}
+		}
+	case []string:
+		for _, name := range values {
+			if name != "" {
+				required[name] = struct{}{}
+			}
+		}
+	}
+	return required
+}
+
+func mergeSchemaRequired(schema map[string]interface{}, additions map[string]struct{}) {
+	if len(additions) == 0 {
+		return
+	}
+	required := schemaRequiredSet(schema["required"])
+	for name := range additions {
+		required[name] = struct{}{}
+	}
+	values := make([]interface{}, 0, len(required))
+	for name := range required {
+		values = append(values, name)
+	}
+	schema["required"] = values
 }
 
 func cloneSchemaMap(m map[string]interface{}) map[string]interface{} {

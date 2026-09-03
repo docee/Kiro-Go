@@ -428,6 +428,68 @@ func TestEnsureObjectSchemaRemovesKiroRejectedFieldsRecursively(t *testing.T) {
 	}
 }
 
+func TestConvertClaudeToolsFlattensTopLevelSchemaCompositions(t *testing.T) {
+	for _, keyword := range []string{"oneOf", "anyOf", "allOf"} {
+		t.Run(keyword, func(t *testing.T) {
+			inputSchema := map[string]interface{}{
+				keyword: []interface{}{
+					map[string]interface{}{
+						"type":     "object",
+						"required": []interface{}{"path"},
+						"properties": map[string]interface{}{
+							"path": map[string]interface{}{"type": "string"},
+						},
+					},
+					map[string]interface{}{
+						"type":     "object",
+						"required": []interface{}{"url"},
+						"properties": map[string]interface{}{
+							"url": map[string]interface{}{
+								"anyOf": []interface{}{
+									map[string]interface{}{"type": "string"},
+									map[string]interface{}{"type": "null"},
+								},
+							},
+						},
+					},
+				},
+			}
+			tools, _ := convertClaudeTools([]ClaudeTool{{Name: "read", InputSchema: inputSchema}})
+			if len(tools) != 1 {
+				t.Fatalf("expected one converted tool, got %d", len(tools))
+			}
+
+			schema := tools[0].ToolSpecification.InputSchema.JSON.(map[string]interface{})
+			if _, exists := schema[keyword]; exists {
+				t.Fatalf("top-level %s reached Amazon Q: %#v", keyword, schema)
+			}
+			properties, ok := schema["properties"].(map[string]interface{})
+			if !ok || properties["path"] == nil || properties["url"] == nil {
+				t.Fatalf("expected properties from all branches, got %#v", schema)
+			}
+			urlSchema := properties["url"].(map[string]interface{})
+			if _, exists := urlSchema["anyOf"]; !exists {
+				t.Fatalf("nested composition should be preserved, got %#v", urlSchema)
+			}
+
+			required := schemaRequiredSet(schema["required"])
+			if keyword == "allOf" {
+				if _, ok := required["path"]; !ok {
+					t.Fatalf("allOf lost required path: %#v", schema)
+				}
+				if _, ok := required["url"]; !ok {
+					t.Fatalf("allOf lost required url: %#v", schema)
+				}
+			} else if len(required) != 0 {
+				t.Fatalf("%s must not require branch-specific fields: %#v", keyword, schema)
+			}
+			if _, exists := inputSchema[keyword]; !exists {
+				t.Fatal("converter mutated caller schema")
+			}
+		})
+	}
+}
+
 func TestConvertOpenAIToolsSanitizesSchemaAndDescription(t *testing.T) {
 	var tool OpenAITool
 	tool.Type = "function"
