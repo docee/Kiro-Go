@@ -361,15 +361,25 @@ defineProvider({
     }
 
     var tokenPoints = [];
-    var creditPoints = [];
-    var requestPoints = [];
+    var dailyActivityRows = [];
     for (var j = 0; j < daily.length; j += 1) {
       // Day-of-month labels keep a full month readable on a narrow chart axis.
       var pointLabel = daily[j].date.slice(8);
       tokenPoints.push({ label: pointLabel, value: daily[j].totalTokens });
-      creditPoints.push({ label: pointLabel, value: daily[j].credits });
-      requestPoints.push({ label: pointLabel, value: daily[j].requests });
+      if (daily[j].credits > 0 || daily[j].requests > 0) {
+        dailyActivityRows.push({
+          label: daily[j].date,
+          value: numberText(daily[j].credits, 3) + " Credit",
+          secondaryValue: numberText(daily[j].requests, 0) + " 次请求",
+        });
+      }
     }
+
+    var activityRows = [
+      { label: "用量最高日", value: busiestCreditDay(daily) },
+      { label: "活跃天数", value: numberText(activeDays(daily), 0) + " / " + rangeDays + " 天" },
+      { label: "日均 Credit", value: numberText(totals.credits / Math.max(1, rangeDays), 3) },
+    ].concat(dailyActivityRows);
 
     var details = [
       {
@@ -380,16 +390,10 @@ defineProvider({
       {
         title: "额度",
         rows: quotaRows,
-        chart: { kind: "bars", title: "每日 Credit", unit: "Credit", points: creditPoints },
       },
       {
         title: "每日活动",
-        rows: [
-          { label: "用量最高日", value: busiestCreditDay(daily) },
-          { label: "活跃天数", value: numberText(activeDays(daily), 0) + " / " + rangeDays + " 天" },
-          { label: "日均 Credit", value: numberText(totals.credits / Math.max(1, rangeDays), 3) },
-        ],
-        chart: { kind: "bars", title: "每日请求数", unit: "次", points: requestPoints },
+        rows: activityRows,
       },
     ];
 
@@ -424,14 +428,6 @@ defineProvider({
       details.splice(1, 0, {
         title: "模型占比",
         rows: modelDetailRows,
-        chart: {
-          kind: "bars",
-          title: "各模型 Token 数",
-          unit: "Token",
-          points: windowModels.slice(0, 12).map(function (entry) {
-            return { label: entry.model === "unknown" ? "未知模型" : entry.model, value: entry.totalTokens };
-          }),
-        },
       });
     }
 
