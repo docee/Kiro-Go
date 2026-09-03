@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func newAuthTestRequest(t *testing.T, header, value string) *http.Request {
@@ -175,6 +176,69 @@ func TestAuthenticateRejectsOverCreditLimit(t *testing.T) {
 	}
 }
 
+func TestAuthenticateResetsPreviousUTCMonthBeforeQuotaCheck(t *testing.T) {
+	mustInitConfig(t)
+	previousMonth := time.Now().UTC().AddDate(0, -1, 0).Format("2006-01")
+	created, err := config.AddApiKey(config.ApiKeyEntry{
+		Name: "monthly", Key: "sk-monthly-auth", Enabled: true, TokenLimit: 10,
+		UsagePeriod: previousMonth, TokensUsed: 10, RequestsCount: 1,
+	})
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	requireAuth(t)
+
+	entry, err := (&Handler{}).authenticate(newAuthTestRequest(t, "Authorization", "Bearer sk-monthly-auth"))
+	if err != nil || entry == nil {
+		t.Fatalf("expected previous-month quota to reset before auth, entry=%v err=%v", entry, err)
+	}
+	got := config.GetApiKeyEntry(created.ID)
+	if got.TokensUsed != 0 || got.RequestsCount != 0 || got.UsagePeriod != time.Now().UTC().Format("2006-01") {
+		t.Fatalf("unexpected normalized quota: %+v", got)
+	}
+}
+
+func TestAdminAPIKeyReadsResetPreviousUTCMonth(t *testing.T) {
+	mustInitConfig(t)
+	previousMonth := time.Now().UTC().AddDate(0, -1, 0).Format("2006-01")
+	created, err := config.AddApiKey(config.ApiKeyEntry{
+		Name: "admin-monthly", Key: "sk-admin-monthly", Enabled: true,
+		UsagePeriod: previousMonth, TokensUsed: 88, CreditsUsed: 4, RequestsCount: 3,
+	})
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	h := &Handler{}
+	listRecorder := httptest.NewRecorder()
+	h.apiListApiKeys(listRecorder, httptest.NewRequest(http.MethodGet, "/admin/api/api-keys", nil))
+	if listRecorder.Code != http.StatusOK {
+		t.Fatalf("list status=%d body=%s", listRecorder.Code, listRecorder.Body.String())
+	}
+	var list struct {
+		APIKeys []apiKeyView `json:"apiKeys"`
+	}
+	if err := json.Unmarshal(listRecorder.Body.Bytes(), &list); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+	if len(list.APIKeys) != 1 || list.APIKeys[0].TokensUsed != 0 || list.APIKeys[0].CreditsUsed != 0 || list.APIKeys[0].RequestsCount != 0 {
+		t.Fatalf("list did not expose reset quota: %+v", list.APIKeys)
+	}
+
+	detailRecorder := httptest.NewRecorder()
+	h.apiGetApiKey(detailRecorder, httptest.NewRequest(http.MethodGet, "/admin/api/api-keys/"+created.ID, nil), created.ID)
+	if detailRecorder.Code != http.StatusOK {
+		t.Fatalf("detail status=%d body=%s", detailRecorder.Code, detailRecorder.Body.String())
+	}
+	var detail apiKeyView
+	if err := json.Unmarshal(detailRecorder.Body.Bytes(), &detail); err != nil {
+		t.Fatalf("decode detail: %v", err)
+	}
+	if detail.TokensUsed != 0 || detail.CreditsUsed != 0 || detail.RequestsCount != 0 {
+		t.Fatalf("detail did not expose reset quota: %+v", detail)
+	}
+}
+
 func TestAuthenticateLegacyFallback(t *testing.T) {
 	mustInitConfig(t)
 	if err := config.UpdateSettings("legacy-key", true, ""); err != nil {
@@ -273,7 +337,7 @@ func TestRecordSuccessForApiKeyUpdatesEntry(t *testing.T) {
 	}
 
 	h := &Handler{}
-	h.recordSuccessForApiKey(created.ID, 25, 30, 0.75)
+	h.recordSuccessForApiKey(created.ID, "claude-sonnet-4", 25, 30, 0.75)
 
 	got := config.GetApiKeyEntry(created.ID)
 	if got == nil {
@@ -288,6 +352,12 @@ func TestRecordSuccessForApiKeyUpdatesEntry(t *testing.T) {
 	if got.RequestsCount != 1 {
 		t.Fatalf("expected RequestsCount=1, got %d", got.RequestsCount)
 	}
+	if len(got.DailyUsage) != 1 || len(got.DailyUsage[0].Models) != 1 {
+		t.Fatalf("expected one model row, got %+v", got.DailyUsage)
+	}
+	if model := got.DailyUsage[0].Models[0]; model.Model != "claude-sonnet-4" || model.TotalTokens != 55 {
+		t.Fatalf("unexpected model attribution: %+v", model)
+	}
 }
 
 func TestRecordSuccessForApiKeyEmptyIDIsNoop(t *testing.T) {
@@ -298,7 +368,7 @@ func TestRecordSuccessForApiKeyEmptyIDIsNoop(t *testing.T) {
 	}
 
 	h := &Handler{}
-	h.recordSuccessForApiKey("", 100, 100, 1)
+	h.recordSuccessForApiKey("", "claude-sonnet-4", 100, 100, 1)
 	got := config.GetApiKeyEntry(created.ID)
 	if got == nil {
 		t.Fatalf("entry missing")

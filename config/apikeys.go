@@ -9,10 +9,108 @@ import (
 	"time"
 )
 
+const usagePeriodFormat = "2006-01"
+
+func usageMonthStart(now time.Time) time.Time {
+	u := now.UTC()
+	return time.Date(u.Year(), u.Month(), 1, 0, 0, 0, 0, time.UTC)
+}
+
+func usageMonth(now time.Time) string { return usageMonthStart(now).Format(usagePeriodFormat) }
+
+// EnsureApiKeyMonthlyReset lazily normalizes every API key against the current
+// UTC calendar month and persists changes.
+func EnsureApiKeyMonthlyReset() error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg == nil {
+		return errors.New("config not initialized")
+	}
+	if ensureApiKeyMonthlyResetLocked(time.Now()) {
+		return saveLocked()
+	}
+	return nil
+}
+
+// EnsureApiKeyMonthlyResetAt is the deterministic variant used by tests.
+func EnsureApiKeyMonthlyResetAt(now time.Time) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg == nil {
+		return errors.New("config not initialized")
+	}
+	if ensureApiKeyMonthlyResetLocked(now) {
+		return saveLocked()
+	}
+	return nil
+}
+
+// ensureApiKeyMonthlyResetLocked updates counters in-place. Caller holds cfgLock.
+// Empty usagePeriod is the pre-monthly schema: preserve counters when a manual
+// reset occurred in this month, otherwise rebuild them from the UTC daily ledger.
+func ensureApiKeyMonthlyResetLocked(now time.Time) bool {
+	if cfg == nil {
+		return false
+	}
+	month := usageMonth(now)
+	monthStart := usageMonthStart(now)
+	changed := false
+	for i := range cfg.ApiKeys {
+		entry := &cfg.ApiKeys[i]
+		if entry.UsagePeriod == "" {
+			if entry.UsageResetAt > 0 && time.Unix(entry.UsageResetAt, 0).UTC().Format(usagePeriodFormat) == month {
+				entry.UsagePeriod = month
+				changed = true
+				continue
+			}
+			entry.TokensUsed, entry.CreditsUsed, entry.RequestsCount = monthlyLedgerTotals(entry, month)
+			entry.UsagePeriod = month
+			entry.UsageResetAt = monthStart.Unix()
+			changed = true
+			continue
+		}
+		if entry.UsagePeriod < month {
+			entry.TokensUsed = 0
+			entry.CreditsUsed = 0
+			entry.RequestsCount = 0
+			entry.UsagePeriod = month
+			entry.UsageResetAt = monthStart.Unix()
+			changed = true
+		}
+	}
+	return changed
+}
+
+func monthlyLedgerTotals(entry *ApiKeyEntry, month string) (tokens int64, credits float64, requests int64) {
+	for _, day := range entry.DailyUsage {
+		if strings.HasPrefix(day.Date, month+"-") {
+			tokens += day.TotalTokens
+			credits += day.Credits
+			requests += day.Requests
+		}
+	}
+	return
+}
+
+const (
+	// unknownModelName is the bucket for requests that arrive without a usable
+	// model label, and the overflow bucket once maxModelsPerDay is reached.
+	unknownModelName = "unknown"
+	// maxModelNameLength bounds a single stored model label.
+	maxModelNameLength = 128
+	// maxModelsPerDay bounds per-day model cardinality in the persisted ledger.
+	maxModelsPerDay = 64
+)
+
 func cloneApiKeyEntry(entry ApiKeyEntry) ApiKeyEntry {
 	cp := entry
 	if entry.DailyUsage != nil {
 		cp.DailyUsage = append([]ApiKeyDailyUsage(nil), entry.DailyUsage...)
+		for i := range cp.DailyUsage {
+			if cp.DailyUsage[i].Models != nil {
+				cp.DailyUsage[i].Models = append([]ApiKeyModelUsage(nil), cp.DailyUsage[i].Models...)
+			}
+		}
 	}
 	return cp
 }
@@ -69,6 +167,9 @@ func AddApiKey(entry ApiKeyEntry) (ApiKeyEntry, error) {
 	}
 	if entry.CreatedAt == 0 {
 		entry.CreatedAt = time.Now().Unix()
+	}
+	if entry.UsagePeriod == "" {
+		entry.UsagePeriod = time.Now().UTC().Format(usagePeriodFormat)
 	}
 	entry = cloneApiKeyEntry(entry)
 	cfg.ApiKeys = append(cfg.ApiKeys, entry)
@@ -170,16 +271,24 @@ func HasApiKeys() bool {
 
 // RecordApiKeyUsage atomically adds input/output tokens and credits to
 // the entry's cumulative counters and UTC daily ledger, then persists the update.
+// The model argument attributes the request to a model name inside the daily
+// record; an empty model is stored under "unknown".
 func RecordApiKeyUsage(id string, inputTokens, outputTokens int64, credits float64) error {
-	return recordApiKeyUsageAt(id, inputTokens, outputTokens, credits, time.Now())
+	return recordApiKeyUsageAt(id, "", inputTokens, outputTokens, credits, time.Now())
 }
 
-func recordApiKeyUsageAt(id string, inputTokens, outputTokens int64, credits float64, now time.Time) error {
+// RecordApiKeyModelUsage is RecordApiKeyUsage with model attribution.
+func RecordApiKeyModelUsage(id, model string, inputTokens, outputTokens int64, credits float64) error {
+	return recordApiKeyUsageAt(id, model, inputTokens, outputTokens, credits, time.Now())
+}
+
+func recordApiKeyUsageAt(id, model string, inputTokens, outputTokens int64, credits float64, now time.Time) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	if cfg == nil {
 		return errors.New("config not initialized")
 	}
+	resetChanged := ensureApiKeyMonthlyResetLocked(now)
 	for i := range cfg.ApiKeys {
 		if cfg.ApiKeys[i].ID == id {
 			if inputTokens < 0 {
@@ -201,14 +310,32 @@ func recordApiKeyUsageAt(id string, inputTokens, outputTokens int64, credits flo
 			cfg.ApiKeys[i].RequestsCount++
 			cfg.ApiKeys[i].LastUsedAt = now.Unix()
 			date := now.UTC().Format("2006-01-02")
-			appendDailyUsage(&cfg.ApiKeys[i], date, inputTokens, outputTokens, totalTokens, credits)
+			appendDailyUsage(&cfg.ApiKeys[i], date, normalizeModelName(model), inputTokens, outputTokens, totalTokens, credits)
 			return saveLocked()
+		}
+	}
+	if resetChanged {
+		if err := saveLocked(); err != nil {
+			return err
 		}
 	}
 	return errors.New("api key not found")
 }
 
-func appendDailyUsage(entry *ApiKeyEntry, date string, inputTokens, outputTokens, totalTokens int64, credits float64) {
+// normalizeModelName trims and lower-bounds a model label so the ledger never
+// stores empty keys and stays stable across casing differences from clients.
+func normalizeModelName(model string) string {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return unknownModelName
+	}
+	if len(model) > maxModelNameLength {
+		model = model[:maxModelNameLength]
+	}
+	return model
+}
+
+func appendDailyUsage(entry *ApiKeyEntry, date, model string, inputTokens, outputTokens, totalTokens int64, credits float64) {
 	idx := sort.Search(len(entry.DailyUsage), func(i int) bool {
 		return entry.DailyUsage[i].Date >= date
 	})
@@ -219,6 +346,7 @@ func appendDailyUsage(entry *ApiKeyEntry, date string, inputTokens, outputTokens
 		usage.OutputTokens += outputTokens
 		usage.TotalTokens += totalTokens
 		usage.Credits += credits
+		addModelUsage(usage, model, inputTokens, outputTokens, totalTokens, credits)
 		return
 	}
 	usage := ApiKeyDailyUsage{
@@ -229,9 +357,46 @@ func appendDailyUsage(entry *ApiKeyEntry, date string, inputTokens, outputTokens
 		TotalTokens:  totalTokens,
 		Credits:      credits,
 	}
+	addModelUsage(&usage, model, inputTokens, outputTokens, totalTokens, credits)
 	entry.DailyUsage = append(entry.DailyUsage, ApiKeyDailyUsage{})
 	copy(entry.DailyUsage[idx+1:], entry.DailyUsage[idx:])
 	entry.DailyUsage[idx] = usage
+}
+
+// addModelUsage merges one request into the day's per-model breakdown, keeping
+// the slice sorted by model name so persisted output is deterministic.
+func addModelUsage(usage *ApiKeyDailyUsage, model string, inputTokens, outputTokens, totalTokens int64, credits float64) {
+	idx := sort.Search(len(usage.Models), func(i int) bool {
+		return usage.Models[i].Model >= model
+	})
+	if idx < len(usage.Models) && usage.Models[idx].Model == model {
+		row := &usage.Models[idx]
+		row.Requests++
+		row.InputTokens += inputTokens
+		row.OutputTokens += outputTokens
+		row.TotalTokens += totalTokens
+		row.Credits += credits
+		return
+	}
+	if len(usage.Models) >= maxModelsPerDay {
+		// Cap cardinality so a client sending random model names cannot grow
+		// the config file without bound; overflow lands in the unknown bucket.
+		if model != unknownModelName {
+			addModelUsage(usage, unknownModelName, inputTokens, outputTokens, totalTokens, credits)
+		}
+		return
+	}
+	row := ApiKeyModelUsage{
+		Model:        model,
+		Requests:     1,
+		InputTokens:  inputTokens,
+		OutputTokens: outputTokens,
+		TotalTokens:  totalTokens,
+		Credits:      credits,
+	}
+	usage.Models = append(usage.Models, ApiKeyModelUsage{})
+	copy(usage.Models[idx+1:], usage.Models[idx:])
+	usage.Models[idx] = row
 }
 
 // ResetApiKeyUsage clears cumulative quota counters and records the reset time.
@@ -242,13 +407,21 @@ func ResetApiKeyUsage(id string) error {
 	if cfg == nil {
 		return errors.New("config not initialized")
 	}
+	now := time.Now()
+	resetChanged := ensureApiKeyMonthlyResetLocked(now)
 	for i := range cfg.ApiKeys {
 		if cfg.ApiKeys[i].ID == id {
 			cfg.ApiKeys[i].TokensUsed = 0
 			cfg.ApiKeys[i].CreditsUsed = 0
 			cfg.ApiKeys[i].RequestsCount = 0
-			cfg.ApiKeys[i].UsageResetAt = time.Now().Unix()
+			cfg.ApiKeys[i].UsageResetAt = usageMonthStart(now).Unix()
+			cfg.ApiKeys[i].UsagePeriod = usageMonth(now)
 			return saveLocked()
+		}
+	}
+	if resetChanged {
+		if err := saveLocked(); err != nil {
+			return err
 		}
 	}
 	return errors.New("api key not found")

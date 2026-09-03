@@ -41,6 +41,11 @@ func toApiKeyView(e config.ApiKeyEntry) apiKeyView {
 }
 
 func (h *Handler) apiListApiKeys(w http.ResponseWriter, r *http.Request) {
+	if err := config.EnsureApiKeyMonthlyReset(); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": "failed to refresh API key quota period"})
+		return
+	}
 	entries := config.ListApiKeys()
 	out := make([]apiKeyView, len(entries))
 	for i, e := range entries {
@@ -50,6 +55,11 @@ func (h *Handler) apiListApiKeys(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) apiGetApiKey(w http.ResponseWriter, r *http.Request, id string) {
+	if err := config.EnsureApiKeyMonthlyReset(); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": "failed to refresh API key quota period"})
+		return
+	}
 	entry := config.GetApiKeyEntry(id)
 	if entry == nil {
 		w.WriteHeader(http.StatusNotFound)
@@ -116,6 +126,11 @@ type apiKeyUpdateRequest struct {
 }
 
 func (h *Handler) apiUpdateApiKey(w http.ResponseWriter, r *http.Request, id string) {
+	if err := config.EnsureApiKeyMonthlyReset(); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": "failed to refresh API key quota period"})
+		return
+	}
 	existing := config.GetApiKeyEntry(id)
 	if existing == nil {
 		w.WriteHeader(http.StatusNotFound)

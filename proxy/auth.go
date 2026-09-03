@@ -55,6 +55,10 @@ func extractProvidedKey(r *http.Request) string {
 // Returns (entry, nil) on success. entry is nil for anonymous/public requests or
 // when the legacy single-key path is used.
 func (h *Handler) authenticate(r *http.Request) (*config.ApiKeyEntry, error) {
+	if err := config.EnsureApiKeyMonthlyReset(); err != nil {
+		return nil, newAuthError(http.StatusInternalServerError, "api_error", "failed to refresh API key quota period")
+	}
+
 	if !config.IsApiKeyRequired() {
 		provided := extractProvidedKey(r)
 		if provided == "" {

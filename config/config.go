@@ -148,6 +148,17 @@ type PromptFilterRule struct {
 	Enabled bool   `json:"enabled"`           // Whether this rule is active
 }
 
+// ApiKeyModelUsage is the per-model slice of one day's usage for an API key.
+// Model holds the normalized model name reported by the client request.
+type ApiKeyModelUsage struct {
+	Model        string  `json:"model"`
+	Requests     int64   `json:"requests,omitempty"`
+	InputTokens  int64   `json:"inputTokens,omitempty"`
+	OutputTokens int64   `json:"outputTokens,omitempty"`
+	TotalTokens  int64   `json:"totalTokens,omitempty"`
+	Credits      float64 `json:"credits,omitempty"`
+}
+
 // ApiKeyDailyUsage is the immutable daily aggregate for one API key.
 // Date is formatted as UTC YYYY-MM-DD.
 type ApiKeyDailyUsage struct {
@@ -157,11 +168,15 @@ type ApiKeyDailyUsage struct {
 	OutputTokens int64   `json:"outputTokens,omitempty"`
 	TotalTokens  int64   `json:"totalTokens,omitempty"`
 	Credits      float64 `json:"credits,omitempty"`
+
+	// Models is the per-model breakdown of this day, sorted by model name.
+	// Older ledgers written before model attribution simply omit it.
+	Models []ApiKeyModelUsage `json:"models,omitempty"`
 }
 
-// ApiKeyEntry represents a single API key with optional usage limits and counters.
-// Limits with value 0 are treated as "no limit". Counters are cumulative and never reset
-// automatically; operators can use the admin endpoint to manually reset them.
+// ApiKeyEntry represents a single API key with UTC-calendar-month usage counters
+// and optional limits. A limit of 0 disables enforcement only; counters still
+// reset at the start of every UTC calendar month identified by UsagePeriod.
 type ApiKeyEntry struct {
 	ID           string `json:"id"`                 // Unique identifier (UUID)
 	Name         string `json:"name,omitempty"`     // Human-readable label
@@ -171,12 +186,13 @@ type ApiKeyEntry struct {
 	CreatedAt    int64  `json:"createdAt"`          // Creation timestamp (Unix seconds)
 	LastUsedAt   int64  `json:"lastUsedAt,omitempty"`
 	UsageResetAt int64  `json:"usageResetAt,omitempty"` // Last cumulative quota reset timestamp (Unix seconds)
+	UsagePeriod  string `json:"usagePeriod,omitempty"`  // UTC calendar month for cumulative quota counters (YYYY-MM)
 
 	// Limits (0 = unlimited)
 	TokenLimit  int64   `json:"tokenLimit,omitempty"`
 	CreditLimit float64 `json:"creditLimit,omitempty"`
 
-	// Cumulative usage (never auto-reset)
+	// Current UTC calendar-month usage (reset automatically at month rollover)
 	TokensUsed    int64   `json:"tokensUsed,omitempty"`
 	CreditsUsed   float64 `json:"creditsUsed,omitempty"`
 	RequestsCount int64   `json:"requestsCount,omitempty"`
@@ -316,6 +332,7 @@ func Load() error {
 		return err
 	}
 	cfg = &c
+	usageChanged := false
 
 	// Migration: if a legacy single ApiKey is present and the new ApiKeys list is empty,
 	// promote it into the new structure. The migrated entry inherits the legacy
@@ -332,9 +349,10 @@ func Load() error {
 			Migrated:  true,
 			CreatedAt: time.Now().Unix(),
 		})
-		if err := saveLocked(); err != nil {
-			return err
-		}
+		usageChanged = true
+	}
+	if ensureApiKeyMonthlyResetLocked(time.Now()) {
+		usageChanged = true
 	}
 
 	// Migration: per-account AllowOverage → OverageStatus.
@@ -354,7 +372,7 @@ func Load() error {
 			overageMigrated = true
 		}
 	}
-	if overageMigrated {
+	if overageMigrated || usageChanged {
 		if err := saveLocked(); err != nil {
 			return err
 		}
