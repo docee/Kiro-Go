@@ -678,6 +678,7 @@
     renderEndpointCode('openaiResponsesEndpoint', baseUrl + '/v1/responses');
     renderEndpointCode('modelsEndpoint', baseUrl + '/v1/models');
     renderEndpointCode('statsEndpoint', baseUrl + '/v1/stats');
+    renderEndpointCode('personalUsageEndpoint', baseUrl + '/v1/usage');
     setTimeout(checkUpdate, 2000);
   }
   async function loadStats() {

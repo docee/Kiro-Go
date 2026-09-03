@@ -121,7 +121,7 @@ func TestAuthenticateRejectsOverTokenLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	if err := config.RecordApiKeyUsage(created.ID, 100, 0); err != nil {
+	if err := config.RecordApiKeyUsage(created.ID, 100, 0, 0); err != nil {
 		t.Fatalf("record usage: %v", err)
 	}
 	requireAuth(t)
@@ -152,7 +152,7 @@ func TestAuthenticateRejectsOverCreditLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	if err := config.RecordApiKeyUsage(created.ID, 0, 1.0); err != nil {
+	if err := config.RecordApiKeyUsage(created.ID, 0, 0, 1.0); err != nil {
 		t.Fatalf("record usage: %v", err)
 	}
 	requireAuth(t)
@@ -243,7 +243,7 @@ func TestRouteWritesTooManyRequestsOpenAI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	if err := config.RecordApiKeyUsage(created.ID, 50, 0); err != nil {
+	if err := config.RecordApiKeyUsage(created.ID, 50, 0, 0); err != nil {
 		t.Fatalf("record: %v", err)
 	}
 	requireAuth(t)
@@ -312,9 +312,10 @@ func TestRecordSuccessForApiKeyEmptyIDIsNoop(t *testing.T) {
 // even after keys exist in the config — e.g. an operator drafted some keys
 // but hasn't flipped the gate yet, or the legacy migration left a disabled
 // entry behind.
-func TestAuthenticateMasterSwitchOffPassesThrough(t *testing.T) {
+func TestAuthenticateMasterSwitchOffPassesThroughAndAttributesKnownKey(t *testing.T) {
 	mustInitConfig(t)
-	if _, err := config.AddApiKey(config.ApiKeyEntry{Name: "drafted", Key: "sk-drafted", Enabled: true}); err != nil {
+	created, err := config.AddApiKey(config.ApiKeyEntry{Name: "drafted", Key: "sk-drafted", Enabled: true})
+	if err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	// RequireApiKey defaults to false — do not flip it on.
@@ -324,7 +325,24 @@ func TestAuthenticateMasterSwitchOffPassesThrough(t *testing.T) {
 		t.Fatalf("expected open access without entry, got entry=%v err=%v", entry, err)
 	}
 	if entry, err := h.authenticate(newAuthTestRequest(t, "Authorization", "Bearer sk-anything")); err != nil || entry != nil {
-		t.Fatalf("expected provided key to be ignored when gate is off, got entry=%v err=%v", entry, err)
+		t.Fatalf("expected unknown key to pass anonymously, got entry=%v err=%v", entry, err)
+	}
+	entry, err := h.authenticate(newAuthTestRequest(t, "Authorization", "Bearer sk-drafted"))
+	if err != nil || entry == nil || entry.ID != created.ID {
+		t.Fatalf("expected enabled key attribution in public mode, got entry=%v err=%v", entry, err)
+	}
+}
+
+func TestAuthenticateMasterSwitchOffDoesNotAttributeDisabledKey(t *testing.T) {
+	mustInitConfig(t)
+	if _, err := config.AddApiKey(config.ApiKeyEntry{Name: "disabled", Key: "sk-disabled-public", Enabled: false}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	h := &Handler{}
+	entry, err := h.authenticate(newAuthTestRequest(t, "Authorization", "Bearer sk-disabled-public"))
+	if err != nil || entry != nil {
+		t.Fatalf("expected disabled key to pass anonymously in public mode, got entry=%v err=%v", entry, err)
 	}
 }
 

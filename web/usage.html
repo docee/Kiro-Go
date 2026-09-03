@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Kiro-Go Usage</title>
+  <link rel="icon" type="image/png" href="/admin/icon.png">
+  <link rel="stylesheet" href="/usage.css">
+</head>
+<body>
+  <main class="page-shell">
+    <header class="page-header">
+      <a class="brand" href="/usage" aria-label="Kiro-Go usage">
+        <img src="/admin/icon.png" alt="">
+        <span>Kiro-Go <small>Usage</small></span>
+      </a>
+      <div class="header-meta">
+        <span id="keyIdentity" class="key-identity">API key usage</span>
+        <span class="utc-badge">UTC</span>
+      </div>
+    </header>
+
+    <section class="intro-row">
+      <div>
+        <p class="eyebrow">PERSONAL METERING</p>
+        <h1>Usage overview</h1>
+        <p class="lede">Track requests, tokens, and credits across your selected UTC dates.</p>
+      </div>
+      <div id="rangeLabel" class="range-label" aria-live="polite">Last 30 days</div>
+    </section>
+
+    <section class="toolbar" aria-label="Usage range">
+      <div class="segmented" role="group" aria-label="Preset range">
+        <button type="button" data-days="7">7 days</button>
+        <button type="button" data-days="30" class="active">30 days</button>
+        <button type="button" data-days="90">90 days</button>
+      </div>
+      <form id="customRange" class="custom-range">
+        <label>From <input id="startDate" type="date" aria-label="Start date"></label>
+        <span aria-hidden="true">to</span>
+        <label>To <input id="endDate" type="date" aria-label="End date"></label>
+        <button class="apply-button" type="submit">Apply</button>
+      </form>
+      <button id="refreshButton" class="refresh-button" type="button" title="Refresh usage" aria-label="Refresh usage">↻</button>
+    </section>
+
+    <div id="state" class="state-panel" role="status" aria-live="polite"></div>
+
+    <div id="content" class="content" hidden>
+      <section class="account-strip">
+        <div><span class="label">Account</span><strong id="accountName">-</strong><span id="accountKey" class="muted">-</span></div>
+        <div><span class="label">Created</span><strong id="createdAt">-</strong></div>
+        <div><span class="label">History from</span><strong id="historyFrom">-</strong></div>
+        <div><span class="label">Last used</span><strong id="lastUsed">-</strong></div>
+      </section>
+
+      <section class="quota-section" aria-labelledby="quotaTitle">
+        <div class="section-heading"><div><p class="eyebrow">CURRENT PERIOD</p><h2 id="quotaTitle">Quota usage</h2></div><span id="resetAt" class="muted">Not reset yet</span></div>
+        <div class="quota-grid">
+          <article class="metric-card quota-card"><div class="metric-top"><span>Credits</span><span id="creditPercent">No limit</span></div><div class="progress-track"><span id="creditProgress"></span></div><div class="metric-values"><strong id="creditsUsed">0</strong><span id="creditsLimit">Unlimited</span></div></article>
+          <article class="metric-card quota-card"><div class="metric-top"><span>Tokens</span><span id="tokenPercent">No limit</span></div><div class="progress-track"><span id="tokenProgress"></span></div><div class="metric-values"><strong id="tokensUsed">0</strong><span id="tokensLimit">Unlimited</span></div></article>
+          <article class="metric-card quota-card"><div class="metric-top"><span>Requests</span><span>Current period</span></div><div class="metric-values standalone"><strong id="requestsUsed">0</strong><span>requests</span></div></article>
+        </div>
+      </section>
+
+      <section class="totals-section" aria-labelledby="totalsTitle">
+        <div class="section-heading"><div><p class="eyebrow">SELECTED RANGE</p><h2 id="totalsTitle">Totals</h2></div><span id="totalDays" class="muted">30 days</span></div>
+        <div class="totals-grid">
+          <article class="metric-card"><span class="label">Requests</span><strong id="totalRequests">0</strong></article>
+          <article class="metric-card"><span class="label">Input tokens</span><strong id="totalInput">0</strong></article>
+          <article class="metric-card"><span class="label">Output tokens</span><strong id="totalOutput">0</strong></article>
+          <article class="metric-card accent"><span class="label">Total tokens</span><strong id="totalTokens">0</strong></article>
+          <article class="metric-card accent"><span class="label">Credits</span><strong id="totalCredits">0</strong></article>
+        </div>
+      </section>
+
+      <section class="chart-section" aria-labelledby="trendTitle">
+        <div class="section-heading"><div><p class="eyebrow">DAILY TREND</p><h2 id="trendTitle">Tokens and credits</h2></div><div class="legend"><span><i class="dot token-dot"></i>Tokens</span><span><i class="dot credit-dot"></i>Credits</span></div></div>
+        <div class="chart-wrap"><canvas id="usageChart" aria-label="Daily tokens and credits chart"></canvas><div id="chartEmpty" class="chart-empty" hidden>No usage in this range</div></div>
+      </section>
+
+      <section class="table-section" aria-labelledby="dailyTitle">
+        <div class="section-heading"><div><p class="eyebrow">BREAKDOWN</p><h2 id="dailyTitle">Daily details</h2></div></div>
+        <div class="table-scroll"><table><thead><tr><th>Date</th><th>Requests</th><th>Input tokens</th><th>Output tokens</th><th>Total tokens</th><th>Credits</th></tr></thead><tbody id="dailyRows"></tbody></table></div>
+      </section>
+    </div>
+  </main>
+  <script src="/usage.js"></script>
+</body>
+</html>

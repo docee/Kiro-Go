@@ -4,9 +4,18 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"sort"
 	"strings"
 	"time"
 )
+
+func cloneApiKeyEntry(entry ApiKeyEntry) ApiKeyEntry {
+	cp := entry
+	if entry.DailyUsage != nil {
+		cp.DailyUsage = append([]ApiKeyDailyUsage(nil), entry.DailyUsage...)
+	}
+	return cp
+}
 
 // ListApiKeys returns a snapshot of all configured API key entries.
 func ListApiKeys() []ApiKeyEntry {
@@ -16,7 +25,9 @@ func ListApiKeys() []ApiKeyEntry {
 		return nil
 	}
 	out := make([]ApiKeyEntry, len(cfg.ApiKeys))
-	copy(out, cfg.ApiKeys)
+	for i := range cfg.ApiKeys {
+		out[i] = cloneApiKeyEntry(cfg.ApiKeys[i])
+	}
 	return out
 }
 
@@ -29,7 +40,7 @@ func GetApiKeyEntry(id string) *ApiKeyEntry {
 	}
 	for i := range cfg.ApiKeys {
 		if cfg.ApiKeys[i].ID == id {
-			cp := cfg.ApiKeys[i]
+			cp := cloneApiKeyEntry(cfg.ApiKeys[i])
 			return &cp
 		}
 	}
@@ -59,13 +70,14 @@ func AddApiKey(entry ApiKeyEntry) (ApiKeyEntry, error) {
 	if entry.CreatedAt == 0 {
 		entry.CreatedAt = time.Now().Unix()
 	}
+	entry = cloneApiKeyEntry(entry)
 	cfg.ApiKeys = append(cfg.ApiKeys, entry)
 	if err := saveLocked(); err != nil {
 		// Roll back the in-memory append so we don't leave inconsistent state.
 		cfg.ApiKeys = cfg.ApiKeys[:len(cfg.ApiKeys)-1]
 		return ApiKeyEntry{}, err
 	}
-	return entry, nil
+	return cloneApiKeyEntry(entry), nil
 }
 
 // UpdateApiKey applies a patch to an existing API key. Patch semantics:
@@ -139,7 +151,7 @@ func FindApiKeyByValue(key string) *ApiKeyEntry {
 	}
 	for i := range cfg.ApiKeys {
 		if cfg.ApiKeys[i].Key == key {
-			cp := cfg.ApiKeys[i]
+			cp := cloneApiKeyEntry(cfg.ApiKeys[i])
 			return &cp
 		}
 	}
@@ -156,9 +168,13 @@ func HasApiKeys() bool {
 	return len(cfg.ApiKeys) > 0
 }
 
-// RecordApiKeyUsage atomically adds tokens and credits to the entry's counters,
-// updates LastUsedAt, increments RequestsCount, and persists.
-func RecordApiKeyUsage(id string, tokens int64, credits float64) error {
+// RecordApiKeyUsage atomically adds input/output tokens and credits to
+// the entry's cumulative counters and UTC daily ledger, then persists the update.
+func RecordApiKeyUsage(id string, inputTokens, outputTokens int64, credits float64) error {
+	return recordApiKeyUsageAt(id, inputTokens, outputTokens, credits, time.Now())
+}
+
+func recordApiKeyUsageAt(id string, inputTokens, outputTokens int64, credits float64, now time.Time) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	if cfg == nil {
@@ -166,22 +182,60 @@ func RecordApiKeyUsage(id string, tokens int64, credits float64) error {
 	}
 	for i := range cfg.ApiKeys {
 		if cfg.ApiKeys[i].ID == id {
-			if tokens > 0 {
-				cfg.ApiKeys[i].TokensUsed += tokens
+			if inputTokens < 0 {
+				inputTokens = 0
 			}
-			if credits > 0 {
+			if outputTokens < 0 {
+				outputTokens = 0
+			}
+			if credits < 0 {
+				credits = 0
+			}
+			totalTokens := inputTokens + outputTokens
+			if totalTokens > 0 {
+				cfg.ApiKeys[i].TokensUsed += totalTokens
+			}
+			if credits != 0 {
 				cfg.ApiKeys[i].CreditsUsed += credits
 			}
 			cfg.ApiKeys[i].RequestsCount++
-			cfg.ApiKeys[i].LastUsedAt = time.Now().Unix()
+			cfg.ApiKeys[i].LastUsedAt = now.Unix()
+			date := now.UTC().Format("2006-01-02")
+			appendDailyUsage(&cfg.ApiKeys[i], date, inputTokens, outputTokens, totalTokens, credits)
 			return saveLocked()
 		}
 	}
 	return errors.New("api key not found")
 }
 
-// ResetApiKeyUsage clears TokensUsed/CreditsUsed/RequestsCount for the entry.
-// LastUsedAt is preserved so operators can still see when the key was last used.
+func appendDailyUsage(entry *ApiKeyEntry, date string, inputTokens, outputTokens, totalTokens int64, credits float64) {
+	idx := sort.Search(len(entry.DailyUsage), func(i int) bool {
+		return entry.DailyUsage[i].Date >= date
+	})
+	if idx < len(entry.DailyUsage) && entry.DailyUsage[idx].Date == date {
+		usage := &entry.DailyUsage[idx]
+		usage.Requests++
+		usage.InputTokens += inputTokens
+		usage.OutputTokens += outputTokens
+		usage.TotalTokens += totalTokens
+		usage.Credits += credits
+		return
+	}
+	usage := ApiKeyDailyUsage{
+		Date:         date,
+		Requests:     1,
+		InputTokens:  inputTokens,
+		OutputTokens: outputTokens,
+		TotalTokens:  totalTokens,
+		Credits:      credits,
+	}
+	entry.DailyUsage = append(entry.DailyUsage, ApiKeyDailyUsage{})
+	copy(entry.DailyUsage[idx+1:], entry.DailyUsage[idx:])
+	entry.DailyUsage[idx] = usage
+}
+
+// ResetApiKeyUsage clears cumulative quota counters and records the reset time.
+// LastUsedAt and the permanent daily ledger are preserved.
 func ResetApiKeyUsage(id string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
@@ -193,6 +247,7 @@ func ResetApiKeyUsage(id string) error {
 			cfg.ApiKeys[i].TokensUsed = 0
 			cfg.ApiKeys[i].CreditsUsed = 0
 			cfg.ApiKeys[i].RequestsCount = 0
+			cfg.ApiKeys[i].UsageResetAt = time.Now().Unix()
 			return saveLocked()
 		}
 	}
@@ -206,15 +261,17 @@ func GenerateApiKeyValue() string {
 	return "sk-" + hex.EncodeToString(buf)
 }
 
-// MaskApiKey produces a display-friendly masked version: keeps first 6 and last 4
-// characters, replaces the middle with "****". Returns "" for empty input and
-// the original string if it's too short to mask meaningfully.
+// MaskApiKey produces a display-friendly masked version without ever returning
+// a non-empty key verbatim.
 func MaskApiKey(key string) string {
 	if key == "" {
 		return ""
 	}
+	if len(key) <= 4 {
+		return strings.Repeat("*", len(key))
+	}
 	if len(key) <= 10 {
-		return key
+		return key[:2] + "****" + key[len(key)-2:]
 	}
 	return key[:6] + "****" + key[len(key)-4:]
 }

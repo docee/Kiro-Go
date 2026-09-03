@@ -445,6 +445,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleOpenAIResponses(w, ar)
 	case path == "/v1/models" || path == "/models":
 		h.handleModels(w, r)
+	case path == "/v1/usage" && r.Method == http.MethodGet:
+		h.handlePersonalUsage(w, r)
 	case path == "/api/event_logging/batch":
 		// Claude Code 遥测端点 - 直接返回 200 OK
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -457,6 +459,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleAdminAPI(w, r)
 	case strings.HasPrefix(path, "/admin/"):
 		h.serveStaticFile(w, r)
+	case path == "/usage" || path == "/usage/":
+		h.serveUsagePage(w, r)
+	case path == "/usage.css" || path == "/usage.js":
+		h.serveUsageAsset(w, r)
 
 	// 健康检查
 	case path == "/health" || path == "/":
@@ -1550,7 +1556,7 @@ func (h *Handler) recordSuccessForApiKey(apiKeyID string, inputTokens, outputTok
 	if apiKeyID == "" {
 		return
 	}
-	if err := config.RecordApiKeyUsage(apiKeyID, int64(inputTokens+outputTokens), credits); err != nil {
+	if err := config.RecordApiKeyUsage(apiKeyID, int64(inputTokens), int64(outputTokens), credits); err != nil {
 		logger.Warnf("[ApiKey] failed to record usage for key %s: %v", apiKeyID, err)
 	}
 }
@@ -4533,6 +4539,18 @@ func (h *Handler) apiGetAccountModelsCached(w http.ResponseWriter, r *http.Reque
 
 func (h *Handler) serveAdminPage(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, "web/index.html")
+}
+
+func (h *Handler) serveUsagePage(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	http.ServeFile(w, r, "web/usage.html")
+}
+
+func (h *Handler) serveUsageAsset(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	http.ServeFile(w, r, "web/"+strings.TrimPrefix(r.URL.Path, "/"))
 }
 
 func (h *Handler) serveStaticFile(w http.ResponseWriter, r *http.Request) {

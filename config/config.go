@@ -148,17 +148,29 @@ type PromptFilterRule struct {
 	Enabled bool   `json:"enabled"`           // Whether this rule is active
 }
 
+// ApiKeyDailyUsage is the immutable daily aggregate for one API key.
+// Date is formatted as UTC YYYY-MM-DD.
+type ApiKeyDailyUsage struct {
+	Date         string  `json:"date"`
+	Requests     int64   `json:"requests,omitempty"`
+	InputTokens  int64   `json:"inputTokens,omitempty"`
+	OutputTokens int64   `json:"outputTokens,omitempty"`
+	TotalTokens  int64   `json:"totalTokens,omitempty"`
+	Credits      float64 `json:"credits,omitempty"`
+}
+
 // ApiKeyEntry represents a single API key with optional usage limits and counters.
 // Limits with value 0 are treated as "no limit". Counters are cumulative and never reset
 // automatically; operators can use the admin endpoint to manually reset them.
 type ApiKeyEntry struct {
-	ID         string `json:"id"`                 // Unique identifier (UUID)
-	Name       string `json:"name,omitempty"`     // Human-readable label
-	Key        string `json:"key"`                // The actual key value clients send
-	Enabled    bool   `json:"enabled"`            // Whether this key may authenticate
-	Migrated   bool   `json:"migrated,omitempty"` // True if migrated from legacy single ApiKey field
-	CreatedAt  int64  `json:"createdAt"`          // Creation timestamp (Unix seconds)
-	LastUsedAt int64  `json:"lastUsedAt,omitempty"`
+	ID           string `json:"id"`                 // Unique identifier (UUID)
+	Name         string `json:"name,omitempty"`     // Human-readable label
+	Key          string `json:"key"`                // The actual key value clients send
+	Enabled      bool   `json:"enabled"`            // Whether this key may authenticate
+	Migrated     bool   `json:"migrated,omitempty"` // True if migrated from legacy single ApiKey field
+	CreatedAt    int64  `json:"createdAt"`          // Creation timestamp (Unix seconds)
+	LastUsedAt   int64  `json:"lastUsedAt,omitempty"`
+	UsageResetAt int64  `json:"usageResetAt,omitempty"` // Last cumulative quota reset timestamp (Unix seconds)
 
 	// Limits (0 = unlimited)
 	TokenLimit  int64   `json:"tokenLimit,omitempty"`
@@ -168,6 +180,10 @@ type ApiKeyEntry struct {
 	TokensUsed    int64   `json:"tokensUsed,omitempty"`
 	CreditsUsed   float64 `json:"creditsUsed,omitempty"`
 	RequestsCount int64   `json:"requestsCount,omitempty"`
+
+	// DailyUsage is a permanent UTC daily ledger for this key. It is not cleared
+	// when cumulative quota counters are reset.
+	DailyUsage []ApiKeyDailyUsage `json:"usageDaily,omitempty"`
 }
 
 // Config represents the global application configuration.

@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestApiKeyMigrationFromLegacyField(t *testing.T) {
@@ -188,7 +189,7 @@ func TestRecordApiKeyUsageConcurrent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < perGoroutine; i++ {
-				if err := RecordApiKeyUsage(created.ID, 7, 0.5); err != nil {
+				if err := RecordApiKeyUsage(created.ID, 7, 0, 0.5); err != nil {
 					atomic.AddInt32(&failures, 1)
 					return
 				}
@@ -227,7 +228,7 @@ func TestResetApiKeyUsage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("add: %v", err)
 	}
-	if err := RecordApiKeyUsage(created.ID, 100, 1.5); err != nil {
+	if err := RecordApiKeyUsage(created.ID, 100, 0, 1.5); err != nil {
 		t.Fatalf("record: %v", err)
 	}
 	if err := ResetApiKeyUsage(created.ID); err != nil {
@@ -240,14 +241,87 @@ func TestResetApiKeyUsage(t *testing.T) {
 	if got.TokensUsed != 0 || got.CreditsUsed != 0 || got.RequestsCount != 0 {
 		t.Fatalf("expected counters to be zeroed, got %+v", got)
 	}
+	if got.UsageResetAt == 0 {
+		t.Fatalf("expected usage reset timestamp")
+	}
+	if len(got.DailyUsage) != 1 || got.DailyUsage[0].TotalTokens != 100 {
+		t.Fatalf("expected reset to preserve daily history, got %+v", got.DailyUsage)
+	}
+}
+
+func TestApiKeyDailyUsageUTCAndSnapshot(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.json")
+	if err := Init(cfgFile); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	created, err := AddApiKey(ApiKeyEntry{Name: "daily", Key: "sk-daily", Enabled: true})
+	if err != nil {
+		t.Fatalf("add: %v", err)
+	}
+
+	// These instants are different local dates but the same UTC date.
+	utcDate := time.Date(2026, time.September, 3, 0, 30, 0, 0, time.UTC)
+	if err := recordApiKeyUsageAt(created.ID, 4, 6, 0.125, utcDate); err != nil {
+		t.Fatalf("record first: %v", err)
+	}
+	if err := recordApiKeyUsageAt(created.ID, 1, 2, 0.375, utcDate.Add(23*time.Hour)); err != nil {
+		t.Fatalf("record same date: %v", err)
+	}
+	if err := recordApiKeyUsageAt(created.ID, 8, 0, 0.5, utcDate.Add(48*time.Hour)); err != nil {
+		t.Fatalf("record later date: %v", err)
+	}
+
+	got := GetApiKeyEntry(created.ID)
+	if got == nil || len(got.DailyUsage) != 2 {
+		t.Fatalf("expected two daily records, got %+v", got)
+	}
+	if got.DailyUsage[0].Date != "2026-09-03" || got.DailyUsage[1].Date != "2026-09-05" {
+		t.Fatalf("expected UTC sorted dates, got %+v", got.DailyUsage)
+	}
+	day := got.DailyUsage[0]
+	if day.Requests != 2 || day.InputTokens != 5 || day.OutputTokens != 8 || day.TotalTokens != 13 || day.Credits != 0.5 {
+		t.Fatalf("unexpected daily aggregate: %+v", day)
+	}
+
+	// Returned entries must not expose the persisted slice backing array.
+	got.DailyUsage[0].TotalTokens = 999
+	got.DailyUsage = append(got.DailyUsage, ApiKeyDailyUsage{Date: "2099-01-01"})
+	snapshot := GetApiKeyEntry(created.ID)
+	if snapshot == nil || snapshot.DailyUsage[0].TotalTokens != 13 || len(snapshot.DailyUsage) != 2 {
+		t.Fatalf("daily usage snapshot leaked internal state: %+v", snapshot)
+	}
+}
+
+func TestApiKeyUsagePersistsAndReloads(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.json")
+	if err := Init(cfgFile); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	created, err := AddApiKey(ApiKeyEntry{Name: "reload", Key: "sk-reload", Enabled: true})
+	if err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if err := RecordApiKeyUsage(created.ID, 11, 7, 0.125); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	if err := Init(cfgFile); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	got := GetApiKeyEntry(created.ID)
+	if got == nil || len(got.DailyUsage) != 1 {
+		t.Fatalf("expected usage to survive reload, got %+v", got)
+	}
+	if got.DailyUsage[0].InputTokens != 11 || got.DailyUsage[0].OutputTokens != 7 || got.DailyUsage[0].TotalTokens != 18 || got.DailyUsage[0].Credits != 0.125 {
+		t.Fatalf("unexpected reloaded usage: %+v", got.DailyUsage[0])
+	}
 }
 
 func TestApiKeyOverLimit(t *testing.T) {
 	tests := []struct {
-		name        string
-		entry       ApiKeyEntry
-		wantToken   bool
-		wantCredit  bool
+		name       string
+		entry      ApiKeyEntry
+		wantToken  bool
+		wantCredit bool
 	}{
 		{"unlimited", ApiKeyEntry{TokensUsed: 100, CreditsUsed: 5}, false, false},
 		{"under token limit", ApiKeyEntry{TokenLimit: 200, TokensUsed: 100}, false, false},
@@ -273,7 +347,8 @@ func TestMaskApiKey(t *testing.T) {
 		want string
 	}{
 		{"", ""},
-		{"short", "short"},
+		{"tiny", "****"},
+		{"short", "sh****rt"},
 		{"sk-1234567890", "sk-123****7890"},
 	}
 	for _, tc := range tests {
